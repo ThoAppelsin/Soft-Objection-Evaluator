@@ -4,16 +4,6 @@ import tarfile
 from pathvalidate import sanitize_filepath
 import coverage
 
-originaltars = [
-"C:/Users/Utkan Gezer/Downloads/exam888-objection.tar.gz",
-"C:/Users/Utkan Gezer/Downloads/exam889-objection.tar.gz"]
-correctiontars = [
-"C:/Users/Utkan Gezer/Downloads/section151_question1287-objection.tar.gz",
-"C:/Users/Utkan Gezer/Downloads/section150_question1286-objection.tar.gz"]
-
-originalsdir = "originals"
-correctionsdir = "corrections"
-
 def tarsextract(tars, outdir):
 	if os.path.isdir(outdir):
 		if click.confirm(f"Directory '{outdir}' already exists, want to delete it and extract new?", default=False):
@@ -27,8 +17,27 @@ def tarsextract(tars, outdir):
 			file.name = sanitize_filepath(file.name, replacement_text="_")
 		tf.extractall(outdir)
 
-tarsextract(originaltars, originalsdir)
-tarsextract(correctiontars, correctionsdir)
+
+def function():
+	pass
+
+
+def main():
+	originaltars = [
+	"C:/Users/Utkan Gezer/Downloads/exam888-objection.tar.gz",
+	"C:/Users/Utkan Gezer/Downloads/exam889-objection.tar.gz"]
+	correctiontars = [
+	"C:/Users/Utkan Gezer/Downloads/section151_question1287-objection.tar.gz",
+	"C:/Users/Utkan Gezer/Downloads/section150_question1286-objection.tar.gz"]
+
+	originalsdir = "originals"
+	correctionsdir = "corrections"
+
+	tarsextract(originaltars, originalsdir)
+	tarsextract(correctiontars, correctionsdir)
 
 # pylint --disable=all --enable=W0105 .\Corrected.py
 
+
+if __name__ == '__main__':
+	main()
