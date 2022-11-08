@@ -27,13 +27,12 @@ def tarsextract(tars, outdir):
 		tf.extractall(outdir)
 
 
+def remove_comments(code):
+	return (line if (comment_start := line.find('#')) == -1 else line[:comment_start] for line in code)
+
 
 def rstrip(code):
 	return (line.rstrip() for line in code)
-
-
-def remove_comments(code):
-	return (line if (comment_start := line.find('#')) == -1 else line[:comment_start] for line in code)
 
 
 def remove_block_comments(code):
@@ -80,7 +79,7 @@ def join_lines(code):
 
 
 def sanitize(code):
-	return list(join_lines(remove_empty_lines(remove_block_comments(remove_comments(rstrip(code))))))
+	return list(join_lines(remove_empty_lines(remove_block_comments(rstrip(remove_comments(code))))))
 
 
 def edit_distance(old, new):
@@ -160,9 +159,7 @@ def main():
 	originaltars = [
 	"C:/Users/Utkan Gezer/Downloads/exam888-objection.tar.gz",
 	"C:/Users/Utkan Gezer/Downloads/exam889-objection.tar.gz"]
-	correctiontars = [
-	"C:/Users/Utkan Gezer/Downloads/section151_question1287-objection.tar.gz",
-	"C:/Users/Utkan Gezer/Downloads/section150_question1286-objection.tar.gz"]
+	correctiontars = [tar for n in range(1,6) for tar in os.listdir(f"C:/Users/utkan/Downloads/m1+/{n}")]
 
 	originalsdir = "originals"
 	correctionsdir = "corrections"
