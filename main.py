@@ -3,7 +3,7 @@ import click
 import tarfile
 from pathvalidate import sanitize_filepath
 import coverage
-import editdistance
+import edit_distance
 from collections import defaultdict
 from pylint import lint
 from pylint.reporters.text import TextReporter
@@ -11,6 +11,8 @@ from io import StringIO
 import tempfile
 import vulture
 import pandas as pd
+import itertools
+import glob
 
 
 def tarsextract(tars, outdir):
@@ -82,8 +84,41 @@ def sanitize(code):
 	return list(join_lines(remove_empty_lines(remove_block_comments(rstrip(remove_comments(code))))))
 
 
-def edit_distance(old, new):
-	return editdistance.eval(old, new)
+def get_comment(line):
+	start = line.find('#')
+	return "" if start == -1 else line[start+1:]
+
+
+def get_comments(code):
+	return (get_comment(line) for line in code)
+
+
+def extract_user_code(code, codepath):
+	bflag = 'DO_NOT_EDIT_ANYTHING_ABOVE_THIS_LINE'
+	eflag = 'DO_NOT_EDIT_ANYTHING_BELOW_THIS_LINE'
+
+	stucode = False
+	for i, line in enumerate(code):
+		comment = get_comment(line)
+		if comment:
+			if bflag in comment:
+				if stucode:
+					print(codepath, "is a code with bad flags...")
+					yield line
+				stucode = True
+				continue
+			elif eflag in comment:
+				if not stucode:
+					print(codepath, "is a code with bad flags...")
+				stucode = False
+				continue
+		if stucode:
+			yield line
+
+
+def calculate_edit_distance(old, new):
+	sm = edit_distance.SequenceMatcher(old, new)
+	return sm.distance()
 
 
 def run_pylint(filename):
@@ -135,15 +170,15 @@ def num_exec(code):
 
 def get_report(oldpath, newpath, should_sanitize=True):
 	with open(oldpath) as oldfile:
-		old = oldfile.readlines()
+		old = extract_user_code(oldfile.readlines(), oldpath)
 	with open(newpath) as newfile:
-		new = newfile.readlines()
+		new = extract_user_code(newfile.readlines(), newpath)
 	if should_sanitize:
 		old = sanitize(old)
 		new = sanitize(new)
 
 	return {
-	'edit_distance': edit_distance(old, new),
+	'edit_distance': calculate_edit_distance(old, new),
 	'old-#lines' : len(old),
 	'new-#lines': len(new),
 	'old-#colonfollow': num_colon_follow(old),
@@ -157,9 +192,9 @@ def get_report(oldpath, newpath, should_sanitize=True):
 
 def main():
 	originaltars = [
-	"C:/Users/Utkan Gezer/Downloads/exam888-objection.tar.gz",
-	"C:/Users/Utkan Gezer/Downloads/exam889-objection.tar.gz"]
-	correctiontars = [tar for n in range(1,6) for tar in os.listdir(f"C:/Users/utkan/Downloads/m1+/{n}")]
+	"C:/Users/utkan/Downloads/exam888-objection.tar.gz",
+	"C:/Users/utkan/Downloads/exam889-objection.tar.gz"]
+	correctiontars = [tar for n in range(1,6) for tar in glob.glob(f"C:/Users/utkan/Downloads/m1+/{n}/*.tar.gz")]
 
 	originalsdir = "originals"
 	correctionsdir = "corrections"
@@ -173,7 +208,7 @@ def main():
 		qid = corrdir.split('_')[2]
 		corrpath = correctionsdir + '/' + corrdir
 		for stuid in os.listdir(corrpath):
-			correctiondict[stuid][qid] = corrpath + '/' + stuid + '/' + qid + '/src_separated/Main.py_1_true.txt'
+			correctiondict[stuid][qid] = corrpath + '/' + stuid + '/' + qid + '/src/Main.py'
 
 	reports = []
 
@@ -182,8 +217,9 @@ def main():
 		for stuid in os.listdir(exampath):
 			examstupath = exampath + '/' + stuid
 			for qid in os.listdir(examstupath):
-				examstuqmainpath = examstupath + '/' + qid + '/src_separated/Main.py_1_true.txt'
+				examstuqmainpath = examstupath + '/' + qid + '/src/Main.py'
 				if qid in correctiondict[stuid]:
+					print(stuid, qid)
 					reports.append({'user': stuid, 'question': qid} | get_report(examstuqmainpath, correctiondict[stuid][qid]))
 
 	df.DataFrame(report)
@@ -192,3 +228,4 @@ def main():
 
 if __name__ == '__main__':
 	main()
+	pass
