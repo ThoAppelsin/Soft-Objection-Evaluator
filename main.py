@@ -5,7 +5,6 @@ from pathvalidate import sanitize_filepath
 import coverage
 import edit_distance
 from collections import defaultdict
-from pylint import lint
 from pylint.reporters.text import TextReporter
 from io import StringIO
 import tempfile
@@ -13,6 +12,9 @@ import vulture
 import pandas as pd
 import itertools
 import glob
+from pathlib import Path
+from contextlib import redirect_stderr
+from alive_progress import alive_bar
 
 
 def tarsextract(tars, outdir):
@@ -34,7 +36,7 @@ def remove_comments(code):
 
 
 def rstrip(code):
-	return (line.rstrip() for line in code)
+	return (line.rstrip(" \t\n\r;") for line in code)
 
 
 def remove_block_comments(code):
@@ -93,27 +95,26 @@ def get_comments(code):
 	return (get_comment(line) for line in code)
 
 
-def extract_user_code(code, codepath):
+def extract_user_code(code):
 	bflag = 'DO_NOT_EDIT_ANYTHING_ABOVE_THIS_LINE'
 	eflag = 'DO_NOT_EDIT_ANYTHING_BELOW_THIS_LINE'
 
-	stucode = False
-	for i, line in enumerate(code):
-		comment = get_comment(line)
-		if comment:
-			if bflag in comment:
-				if stucode:
-					print(codepath, "is a code with bad flags...")
-					yield line
-				stucode = True
-				continue
-			elif eflag in comment:
-				if not stucode:
-					print(codepath, "is a code with bad flags...")
-				stucode = False
-				continue
-		if stucode:
-			yield line
+	flags = (True if bflag in c else False if eflag in c else None for c in get_comments(code))
+	flags = [(i, f) for i, f in enumerate(flags) if f != None]
+	goodflags = all(x[1] for x in flags[::2]) and not any(x[1] for x in flags[1::2]) and len(flags) % 2 == 0
+
+	def sturanges():
+		rangestart = -1
+		for i, f in flags:
+			if rangestart == -1:
+				if f:
+					rangestart = i + 1
+			else:
+				if not f:
+					yield (rangestart, i)
+					rangestart = -1
+
+	return [line for r in sturanges() for line in code[r[0]:r[1]]], goodflags
 
 
 def calculate_edit_distance(old, new):
@@ -122,6 +123,8 @@ def calculate_edit_distance(old, new):
 
 
 def run_pylint(filename):
+	from pylint import lint
+
 	PERFECT = "\n------------------------------------\nYour code has been rated at 10.00/10\n\n"
 	ARGS = ["--disable=all", "--enable=W0104,W0105"]
 	outIO = StringIO()
@@ -130,13 +133,16 @@ def run_pylint(filename):
 	outIO.seek(0)
 	output = outIO.read()
 
-	return output == PERFECT or output
+	return output == PERFECT or output == "" or output
 
 
 def run_vulture(filename):
 	v = vulture.Vulture()
-	v.scavenge([filename])
-	output = [item.get_report() for item in v.get_unused_code()]
+	with redirect_stderr(StringIO()) as f:
+		v.scavenge([filename])
+	errout = f.getvalue()
+	output = [errout] if errout else []
+	output += [item.get_report() for item in v.get_unused_code()]
 	return output == [] or '\n'.join(output)
 
 
@@ -170,9 +176,9 @@ def num_exec(code):
 
 def get_report(oldpath, newpath, should_sanitize=True):
 	with open(oldpath) as oldfile:
-		old = extract_user_code(oldfile.readlines(), oldpath)
+		old, oldgoodflags = extract_user_code(oldfile.readlines())
 	with open(newpath) as newfile:
-		new = extract_user_code(newfile.readlines(), newpath)
+		new, newgoodflags = extract_user_code(newfile.readlines())
 	if should_sanitize:
 		old = sanitize(old)
 		new = sanitize(new)
@@ -186,15 +192,18 @@ def get_report(oldpath, newpath, should_sanitize=True):
 	'old-#semicolon': num_semicolon(old),
 	'new-#semicolon': num_semicolon(new),
 	'old-#exec': num_exec(old),
-	'new-#exec': num_exec(new)
+	'new-#exec': num_exec(new),
+	'old-goodflags': oldgoodflags,
+	'new-goodflags': newgoodflags
 	} | run_tests(old, 'old') | run_tests(new, 'new')
 
 
 def main():
+	downloads = Path.home() / "Downloads"
 	originaltars = [
-	"C:/Users/utkan/Downloads/exam888-objection.tar.gz",
-	"C:/Users/utkan/Downloads/exam889-objection.tar.gz"]
-	correctiontars = [tar for n in range(1,6) for tar in glob.glob(f"C:/Users/utkan/Downloads/m1+/{n}/*.tar.gz")]
+	downloads / "exam888-objection.tar.gz",
+	downloads / "exam889-objection.tar.gz"]
+	correctiontars = [tar for n in range(1,6) for tar in (downloads / f"m1+/{n}").glob("*.tar.gz")]
 
 	originalsdir = "originals"
 	correctionsdir = "corrections"
@@ -205,24 +214,32 @@ def main():
 	correctiondict = defaultdict(dict)
 
 	for corrdir in os.listdir(correctionsdir):
-		qid = corrdir.split('_')[2]
+		_, sid, qid = corrdir.split('_')
 		corrpath = correctionsdir + '/' + corrdir
 		for stuid in os.listdir(corrpath):
-			correctiondict[stuid][qid] = corrpath + '/' + stuid + '/' + qid + '/src/Main.py'
+			correctiondict[stuid][qid] = {'path': corrpath + '/' + stuid + '/' + qid + '/src/Main.py', 'section': sid}
 
 	reports = []
 
-	for examdir in os.listdir(originalsdir):
-		exampath = originalsdir + '/' + examdir
-		for stuid in os.listdir(exampath):
-			examstupath = exampath + '/' + stuid
-			for qid in os.listdir(examstupath):
-				examstuqmainpath = examstupath + '/' + qid + '/src/Main.py'
-				if qid in correctiondict[stuid]:
-					print(stuid, qid)
-					reports.append({'user': stuid, 'question': qid} | get_report(examstuqmainpath, correctiondict[stuid][qid]))
+	with alive_bar(len(glob.glob(originalsdir + "/*/*/*"))) as bar:
+		for examdir in os.listdir(originalsdir):
+			examid = examdir.split('_')[1]
+			exampath = originalsdir + '/' + examdir
+			for stuid in os.listdir(exampath):
+				examstupath = exampath + '/' + stuid
+				for qid in os.listdir(examstupath):
+					examstuqmainpath = examstupath + '/' + qid + '/src/Main.py'
+					if qid in correctiondict[stuid]:
+						reports.append({
+							'user': stuid,
+							'question': qid,
+							'section': correctiondict[stuid][qid]['section'],
+							'exam': examid
+							} | get_report(examstuqmainpath, correctiondict[stuid][qid]['path']))
 
-	df.DataFrame(report)
+					bar()
+
+	df = pd.DataFrame(reports)
 	df.to_csv('report.csv')
 
 
