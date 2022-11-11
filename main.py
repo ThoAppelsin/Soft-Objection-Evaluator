@@ -174,6 +174,22 @@ def num_exec(code):
 	return '\n'.join(code).count('exec(')
 
 
+flawless = {
+	'old-#colonfollow': 0,
+	'new-#colonfollow': 0,
+	'old-#semicolon': 0,
+	'new-#semicolon': 0,
+	'old-#exec': 0,
+	'new-#exec': 0,
+	'old-goodflags': True,
+	'new-goodflags': True,
+	'old-pylintres': True,
+	'old-vultureres': True,
+	'new-pylintres': True,
+	'new-vultureres': True
+	}
+
+
 def get_report(oldpath, newpath, should_sanitize=True):
 	with open(oldpath) as oldfile:
 		old, oldgoodflags = extract_user_code(oldfile.readlines())
@@ -183,7 +199,7 @@ def get_report(oldpath, newpath, should_sanitize=True):
 		old = sanitize(old)
 		new = sanitize(new)
 
-	return {
+	return len(new) > 0 and {
 	'edit_distance': calculate_edit_distance(old, new),
 	'old-#lines' : len(old),
 	'new-#lines': len(new),
@@ -230,19 +246,26 @@ def main():
 				for qid in os.listdir(examstupath):
 					examstuqmainpath = examstupath + '/' + qid + '/src/Main.py'
 					if qid in correctiondict[stuid]:
-						reports.append({
-							'user': stuid,
-							'question': qid,
-							'section': correctiondict[stuid][qid]['section'],
-							'exam': examid
-							} | get_report(examstuqmainpath, correctiondict[stuid][qid]['path']))
+						corrstuqmainpath = correctiondict[stuid][qid]['path']
+						report = get_report(examstuqmainpath, corrstuqmainpath)
+						if report:
+							reports.append({
+								'user': stuid,
+								'old': f'=HYPERLINK("{examstuqmainpath}")',
+								'new': f'=HYPERLINK("{corrstuqmainpath}")',
+								# 'question': qid,
+								# 'section': correctiondict[stuid][qid]['section'],
+								# 'exam': examid
+								} | report)
 
 					bar()
 
 	df = pd.DataFrame(reports)
+	df['needs_inspection'] = df.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1) # (df[flawless.keys()] != flawless.values()).any(axis=1)
+	df = df.drop(columns=[c for c, fless in flawless.items() if all(df[c] == fless)])
 	df.to_csv('report.csv')
+	return df
 
 
 if __name__ == '__main__':
-	main()
-	pass
+	df = main()
