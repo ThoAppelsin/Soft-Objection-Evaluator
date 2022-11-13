@@ -14,7 +14,11 @@ import itertools
 import glob
 from pathlib import Path
 from contextlib import redirect_stderr
-from alive_progress import alive_bar
+from alive_progress import alive_bar, alive_it
+import tokenize
+from time import sleep
+import mergedeep
+import ast
 
 
 def tarsextract(tars, outdir):
@@ -31,59 +35,119 @@ def tarsextract(tars, outdir):
 		tf.extractall(outdir)
 
 
-def remove_comments(code):
-	return (line if (comment_start := line.find('#')) == -1 else line[:comment_start] for line in code)
-
-
-def rstrip(code):
-	return (line.rstrip(" \t\n\r;") for line in code)
-
-
-def remove_block_comments(code):
-	incomment = False
-	commenttype = ''
+def join_triplequote_strings(code):
+	rline = ''
+	inquotes = False
 	for line in code:
-		if incomment:
-			if line.find(commenttype * 3) >= 0:
-				incomment = False
+		rline += line
+		qactivity = True
+		while qactivity:
+			qactivity = False
+			if inquotes:
+				qend = line.find(inquotes)
+				if qend != -1:
+					line = line[qend+len(inquotes):]
+					inquotes = False
+					qactivity = True
+			else:
+				qstart = sorted((s, q) for q in ["'''", '"""'] if (s := line.find(q)) != -1)
+				if qstart:
+					s, q = qstart[0]
+					line = line[s+len(q):]
+					inquotes = q
+					qactivity = True
+		if inquotes:
+			if not rline.endswith('\\'):
+				rline += '\\n'
 		else:
-			l = line
-			found_inline_comment = True
-			while found_inline_comment:
-				found_inline_comment = False
-				l = l.lstrip()
-				for ctype in ['"', "'"]:
-					if l.startswith(ctype * 3):
-						cend = l[3:].find(ctype * 3)
-						if cend == -1:
-							incomment = True
-							commenttype = ctype
-							break
-						else:
-							l = l[cend+6:]
-							found_inline_comment = True
-							break
-			if not incomment and l.strip() != '':
-				yield line
+			yield rline
+			rline = ''
 
 
-def remove_empty_lines(code):
-	return (line for line in code if line != '')
+def comment_index(line):
+	try:
+		comments = [x for x in tokenize.generate_tokens(StringIO(line).readline) if x[0] == tokenize.COMMENT]
+		return comments[0][2][1] if len(comments) == 1 else -1
+	except tokenize.TokenError as e:
+		if line.find('#') != -1:
+			sleep(10)
+			print("We have a # and:", str(e))
+		return -1
 
 
 def join_lines(code):
 	rline = ''
 	for line in code:
 		rline += line
-		if rline.endswith('\\'):
+		if comment_index(line) == -1 and rline.endswith('\\'):
 			rline = rline[:-1]
 		else:
 			yield rline
 			rline = ''
 
 
+# def remove_triplequote_comments(code):
+# 	incomment = False
+# 	commenttype = ''
+# 	for line in code:
+# 		if incomment:
+# 			if line.find(commenttype * 3) >= 0:
+# 				incomment = False
+# 		else:
+# 			l = line
+# 			found_inline_comment = True
+# 			while found_inline_comment:
+# 				found_inline_comment = False
+# 				l = l.lstrip()
+# 				for ctype in ['"', "'"]:
+# 					if l.startswith(ctype * 3):
+# 						cend = l[3:].find(ctype * 3)
+# 						if cend == -1:
+# 							incomment = True
+# 							commenttype = ctype
+# 							break
+# 						else:
+# 							l = l[cend+6:]
+# 							found_inline_comment = True
+# 							break
+# 			if not incomment and l.strip() != '':
+# 				yield line
+
+
+def remove_quote_comments(code):
+	for line in code:
+		l = line.strip()
+		repeat = True
+		while repeat:
+			repeat = False
+			for q in ["'''", '"""', "'", '"']:
+				if l.startswith(q):
+					qend = l.find(q, len(q))
+					if qend == -1:
+						sleep(10)
+						print(f"Quotes left unclosed! Full line: >{line}< and rest of the line >{l}")
+						break
+					l = l[qend+len(q):].lstrip()
+					repeat = True
+					break
+		if l != '':
+			yield line
+
+
+def remove_comments(code):
+	return (line if (ci := comment_index(line)) == -1 else line[:ci] for line in code)
+
+
+def rstrip(code):
+	return (line.rstrip(" \t\n\r;") for line in code)
+
+
+def remove_empty_lines(code):
+	return (line for line in code if line != '')
+
+
 def sanitize(code):
-	return list(join_lines(remove_empty_lines(remove_block_comments(rstrip(remove_comments(code))))))
+	return list(remove_empty_lines(rstrip(remove_comments(remove_quote_comments(join_lines(join_triplequote_strings(code)))))))
 
 
 def get_comment(line):
@@ -122,13 +186,13 @@ def calculate_edit_distance(old, new):
 	return sm.distance()
 
 
-def run_pylint(filename):
+def run_pylint(testfpath):
 	from pylint import lint
 
 	PERFECT = "\n------------------------------------\nYour code has been rated at 10.00/10\n\n"
 	ARGS = ["--disable=all", "--enable=W0104,W0105"]
 	outIO = StringIO()
-	lint.Run([filename]+ARGS, reporter=TextReporter(outIO), exit=False)
+	lint.Run([testfpath]+ARGS, reporter=TextReporter(outIO), exit=False)
 
 	outIO.seek(0)
 	output = outIO.read()
@@ -136,30 +200,44 @@ def run_pylint(filename):
 	return output == PERFECT or output == "" or output
 
 
-def run_vulture(filename):
+def prepare_vulture_whitelist(srcpath):
+	wlpath = srcpath.parent / (srcpath.stem + '-whitelist.py')
+
+	v = vulture.Vulture()
+	v.scavenge([srcpath])
+	with open(wlpath, 'w') as wlf:
+		print('\n'.join(item.get_whitelist_string() for item in v.get_unused_code()), file=wlf)
+
+	return wlpath
+
+
+def run_vulture(testfpath, vulturewlpath):
 	v = vulture.Vulture()
 	with redirect_stderr(StringIO()) as f:
-		v.scavenge([filename])
-	errout = f.getvalue()
+		v.scavenge([testfpath, vulturewlpath])
+		errout = f.getvalue()
+	vulpath = vulture.utils.format_path(Path(testfpath).resolve())
+	invalid_syntax_regex = str(vulpath).replace('\\', '\\\\') + r":\d+: invalid syntax at .*"
+	errout = '\n'.join(l for l in errout.splitlines() if not re.match(invalid_syntax_regex, l))
 	output = [errout] if errout else []
 	output += [item.get_report() for item in v.get_unused_code()]
 	return output == [] or '\n'.join(output)
 
 
-def run_tests(code, prepend=''):
+def run_tests(code, vulturewlpath, prepend=''):
 	temp = tempfile.NamedTemporaryFile(mode="w", delete=False)
 	temp.write('\n'.join(code))
-	filename = temp.name
+	testfpath = temp.name
 	temp.close()
 
-	pylintres = run_pylint(filename)
-	vultureres = run_vulture(filename)
+	pylintres = run_pylint(testfpath)
+	vultureres = run_vulture(testfpath, vulturewlpath)
 
-	os.remove(filename)
+	os.remove(testfpath)
 
 	if prepend:
 		prepend += '-'
-	return {prepend + 'pylintres': pylintres, prepend + 'vultureres': vultureres}
+	return {prepend + 'pylint': pylintres, prepend + 'vultur': vultureres}
 
 
 def num_colon_follow(code):
@@ -170,100 +248,161 @@ def num_semicolon(code):
 	return '\n'.join(code).count(';')
 
 
+def num_comma(code):
+	return len(re.findall(r""",\s*(?!"|'|\s|end\s*=)""", '\n'.join(code)))
+
+
 def num_exec(code):
 	return '\n'.join(code).count('exec(')
 
 
+class MultiAssignCountVisitor(ast.NodeVisitor):
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.count = 0
+
+	def visit_Assign(self, node):
+		if len(node.targets) > 1 or any(type(t) is ast.Tuple for t in node.targets):
+			self.count += 1
+
+
+def num_multi_assign(code):
+	macv = MultiAssignCountVisitor()
+	ap = ast.parse('\n'.join(code))
+	macv.visit(ap)
+	return macv.count
+
+
+def num_multi_assign_naive(code):
+	return sum(0 if (eqidx := line.find('=')) == -1 else line[:eqidx].count(',') for line in code)
+
+
 flawless = {
-	'old-#colonfollow': 0,
-	'new-#colonfollow': 0,
-	'old-#semicolon': 0,
-	'new-#semicolon': 0,
+	'old-#colfol': 0,
+	'old-#semcol': 0,
+	'old-#comma': 0,
 	'old-#exec': 0,
+	# 'old-#mulas': 0,
+	'old-flagOK': True,
+	'old-pylint': True,
+	'old-vultur': True,
+	'new-#colfol': 0,
+	'new-#semcol': 0,
+	'new-#comma': 0,
 	'new-#exec': 0,
-	'old-goodflags': True,
-	'new-goodflags': True,
-	'old-pylintres': True,
-	'old-vultureres': True,
-	'new-pylintres': True,
-	'new-vultureres': True
+	# 'new-#mulas': 0,
+	'new-flagOK': True,
+	'new-pylint': True,
+	'new-vultur': True
 	}
 
 
-def get_report(oldpath, newpath, should_sanitize=True):
+def get_report(oldpath, newpath, vulturewlpath, should_sanitize=True):
 	with open(oldpath) as oldfile:
-		old, oldgoodflags = extract_user_code(oldfile.readlines())
+		oldfull = oldfile.read().splitlines()
+		old, oldgoodflags = extract_user_code(oldfull)
 	with open(newpath) as newfile:
-		new, newgoodflags = extract_user_code(newfile.readlines())
+		newfull = newfile.read().splitlines()
+		new, newgoodflags = extract_user_code(newfull)
 	if should_sanitize:
+		oldfull = sanitize(oldfull)
+		newfull = sanitize(newfull)
 		old = sanitize(old)
 		new = sanitize(new)
 
 	return len(new) > 0 and {
-	'edit_distance': calculate_edit_distance(old, new),
+	'edit_dist': calculate_edit_distance(old, new),
 	'old-#lines' : len(old),
-	'new-#lines': len(new),
-	'old-#colonfollow': num_colon_follow(old),
-	'new-#colonfollow': num_colon_follow(new),
-	'old-#semicolon': num_semicolon(old),
-	'new-#semicolon': num_semicolon(new),
+	'old-#colfol': num_colon_follow(old),
+	'old-#semcol': num_semicolon(old),
+	'old-#comma': num_comma(old),
 	'old-#exec': num_exec(old),
+	# 'old-#mulas': num_multi_assign_naive(old),
+	'old-flagOK': oldgoodflags,
+	} | run_tests(oldfull, vulturewlpath, 'old') | {
+	'new-#lines': len(new),
+	'new-#colfol': num_colon_follow(new),
+	'new-#semcol': num_semicolon(new),
+	'new-#comma': num_comma(new),
 	'new-#exec': num_exec(new),
-	'old-goodflags': oldgoodflags,
-	'new-goodflags': newgoodflags
-	} | run_tests(old, 'old') | run_tests(new, 'new')
+	# 'new-#mulas': num_multi_assign_naive(new),
+	'new-flagOK': newgoodflags
+	} | run_tests(newfull, vulturewlpath, 'new')
+
+
+def subreport(report, tag):
+	return {k: v for k, v in report.items() if (k.startswith(f"{tag}-") if tag else "-" not in k)}
+
+
+def collect_gradebook(srcpath, dstpath):
+	gradebook = pd.read_excel(dstpath, header=1)
+	gradecolumns = [c for c in gradebook.columns if c.startswith('Total')]
+
+	return {f"user{r['User ID']}":
+				{f"question{q}": g for q, g in zip(r["Question Id List"].split(", "), r[gradecolumns])}
+					for i, r in gradebook.iterrows()}
 
 
 def main():
 	downloads = Path.home() / "Downloads"
-	originaltars = [
-	downloads / "exam888-objection.tar.gz",
-	downloads / "exam889-objection.tar.gz"]
-	correctiontars = [tar for n in range(1,6) for tar in (downloads / f"m1+/{n}").glob("*.tar.gz")]
 
-	originalsdir = "originals"
-	correctionsdir = "corrections"
+	questiontars = downloads.glob("mt1/*.tar.gz")
+	originaltars = [downloads / "exam888-objection.tar.gz",
+					downloads / "exam889-objection.tar.gz"]
+	correctiontars = downloads.glob("m1+/*/*.tar.gz")
 
+	questionsdir = Path("questions")
+	originalsdir = Path("originals")
+	correctionsdir = Path("corrections")
+
+	# EXTRACT TARS
+	tarsextract(questiontars, questionsdir)
 	tarsextract(originaltars, originalsdir)
 	tarsextract(correctiontars, correctionsdir)
 
-	correctiondict = defaultdict(dict)
+	# PREPARE VULTURE WHITELISTS
+	vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in questionsdir.iterdir()}
 
-	for corrdir in os.listdir(correctionsdir):
-		_, sid, qid = corrdir.split('_')
-		corrpath = correctionsdir + '/' + corrdir
-		for stuid in os.listdir(corrpath):
-			correctiondict[stuid][qid] = {'path': corrpath + '/' + stuid + '/' + qid + '/src/Main.py', 'section': sid}
+	# PREPARE POINTERS TO CORRECTIONS
+	correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
+											for cpath in correctionsdir.glob("*/*/*/src/Main.py")))
 
+	# COLLECT CORRECTION GRADES
+	correctiongradexlsxs = downloads.glob("m1+/*/*.xlsx")
+	## TODO
+
+
+	# PREPARE REPORT
 	reports = []
 
-	with alive_bar(len(glob.glob(originalsdir + "/*/*/*"))) as bar:
-		for examdir in os.listdir(originalsdir):
-			examid = examdir.split('_')[1]
-			exampath = originalsdir + '/' + examdir
-			for stuid in os.listdir(exampath):
-				examstupath = exampath + '/' + stuid
-				for qid in os.listdir(examstupath):
-					examstuqmainpath = examstupath + '/' + qid + '/src/Main.py'
-					if qid in correctiondict[stuid]:
-						corrstuqmainpath = correctiondict[stuid][qid]['path']
-						report = get_report(examstuqmainpath, corrstuqmainpath)
-						if report:
-							reports.append({
-								'user': stuid,
-								'old': f'=HYPERLINK("{examstuqmainpath}")',
-								'new': f'=HYPERLINK("{corrstuqmainpath}")',
-								# 'question': qid,
-								# 'section': correctiondict[stuid][qid]['section'],
-								# 'exam': examid
-								} | report)
+	for opath in (bar := alive_it(list(originalsdir.glob("*/*/*/src/Main.py")))):
+		examid = opath.parts[-5].split('_')[1]
+		stuid = opath.parts[-4]
+		qid = opath.parts[-3]
 
-					bar()
+		bar.title(f'on {stuid}-{qid}')
+
+		if qid in correctiondict[stuid]:
+			cpath = correctiondict[stuid][qid]['path']
+			report = get_report(opath, cpath, vulturewldict[qid])
+			if report:
+				reports.append({
+					'user': stuid,
+					'qid': qid,
+					'sect': correctiondict[stuid][qid]['section'],
+					'exam': examid,
+					'old': f'=HYPERLINK("{opath}")'
+					} | subreport(report, 'old') | {
+					'new': f'=HYPERLINK("{cpath}")'
+					} | subreport(report, 'new') | subreport(report, False))
 
 	df = pd.DataFrame(reports)
-	df['needs_inspection'] = df.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1) # (df[flawless.keys()] != flawless.values()).any(axis=1)
-	df = df.drop(columns=[c for c, fless in flawless.items() if all(df[c] == fless)])
-	df.to_csv('report.csv')
+	df['ratio'] = 1 - df['edit_dist'] / df[['old-#lines', 'new-#lines']].max(axis=1)
+	df['inspect'] = df.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1)
+	
+	df.to_excel('report_full.xlsx')
+	df[( c for c in df.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (df[c] != flawless[c]).any()) )].to_excel('report_summary.xlsx')
+	
 	return df
 
 

@@ -1,5 +1,8 @@
 originals/
 corrections/
+questions/
 env/
 __pycache__/
-report.csv
+*.csv
+*.7z
+*.xlsx
