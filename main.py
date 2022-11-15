@@ -19,6 +19,7 @@ import tokenize
 from time import sleep
 import mergedeep
 import ast
+import warnings
 
 
 def tarsextract(tars, outdir):
@@ -28,6 +29,7 @@ def tarsextract(tars, outdir):
 		else:
 			return
 
+	os.mkdir(outdir)
 	for tar in tars:
 		tf = tarfile.open(tar)
 		for file in tf:
@@ -334,77 +336,115 @@ def subreport(report, tag):
 	return {k: v for k, v in report.items() if (k.startswith(f"{tag}-") if tag else "-" not in k)}
 
 
-def collect_gradebook(srcpath, dstpath):
-	gradebook = pd.read_excel(dstpath, header=1)
+def collect_gradebook(path, suffix):
+	with warnings.catch_warnings(record=True):
+		gradebook = pd.read_excel(path, header=1)
+
 	gradecolumns = [c for c in gradebook.columns if c.startswith('Total')]
 
-	return {f"user{r['User ID']}":
-				{f"question{q}": g for q, g in zip(r["Question Id List"].split(", "), r[gradecolumns])}
-					for i, r in gradebook.iterrows()}
+	if len(qlists := gradebook["Question Id List"].unique()) != 1:
+		print(f"Gradebook {path.name} contains multiple Question Id Lists: {qlists}")
+
+	return ({'user': f"user{r['User ID']}", 'qid': f"question{q}", f'grade-{suffix}': g}
+			for i, r in gradebook.iterrows()
+			for q, g in zip(str(r["Question Id List"]).split(", "), r[gradecolumns]))
 
 
-def main():
-	downloads = Path.home() / "Downloads"
+# def main():
+coursehome = Path.home() / "Downloads/cmpe150fall2022"
+mthome = coursehome / "mt1"
 
-	questiontars = downloads.glob("mt1/*.tar.gz")
-	originaltars = [downloads / "exam888-objection.tar.gz",
-					downloads / "exam889-objection.tar.gz"]
-	correctiontars = downloads.glob("m1+/*/*.tar.gz")
+questiontars = mthome.glob("mt1questions/*.tar.gz")
+originaltars = mthome.glob("mt1originals/*.tar.gz")
+correctiontars = mthome.glob("mt1corrections/*/*.tar.gz")
 
-	questionsdir = Path("questions")
-	originalsdir = Path("originals")
-	correctionsdir = Path("corrections")
+questionsdir = Path("questions")
+originalsdir = Path("originals")
+correctionsdir = Path("corrections")
 
-	# EXTRACT TARS
-	tarsextract(questiontars, questionsdir)
-	tarsextract(originaltars, originalsdir)
-	tarsextract(correctiontars, correctionsdir)
+# EXTRACT TARS
+tarsextract(questiontars, questionsdir)
+tarsextract(originaltars, originalsdir)
+tarsextract(correctiontars, correctionsdir)
 
-	# PREPARE VULTURE WHITELISTS
-	vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in questionsdir.iterdir()}
+# PREPARE VULTURE WHITELISTS
+vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in questionsdir.iterdir()}
 
-	# PREPARE POINTERS TO CORRECTIONS
-	correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
-											for cpath in correctionsdir.glob("*/*/*/src/Main.py")))
+# PREPARE POINTERS TO CORRECTIONS
+correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
+										for cpath in correctionsdir.glob("*/*/*/src/Main.py")))
 
-	# COLLECT CORRECTION GRADES
-	correctiongradexlsxs = downloads.glob("m1+/*/*.xlsx")
-	## TODO
+# COLLECT ORIGINAL GRADES
+originalgradebooks = mthome.glob("mt1originals/*.xlsx")
+originaldf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'original') for gb in originalgradebooks))).set_index(['user', 'qid'])
+
+# COLLECT CORRECTION GRADES
+correctiongradebooks = mthome.glob("mt1corrections/*/*.xlsx")
+correctiondf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'correction') for gb in correctiongradebooks))).set_index(['user', 'qid'])
+
+# COLLECT STUDENT INFO
+studentinfodf = pd.read_excel(coursehome / 'studentinfo.xlsx')
+studentinfodf['user'] = ['user' + str(x) for x in studentinfodf['user']]
+studentinfodf = studentinfodf.set_index('user')
+studentinfodf.columns = pd.MultiIndex.from_product([['INFO'], studentinfodf.columns])
+
+# PREPARE REPORT
+reports = []
+
+qidtoqnum = {
+	'question1291': 'q1',
+	'question1292': 'q1',
+	'question1293': 'q2',
+	'question1294': 'q2',
+	'question1295': 'q3',
+	'question1296': 'q3'
+	}
+
+for opath in (bar := alive_it(list(originalsdir.glob("*/*/*/src/Main.py")))):
+	examid = opath.parts[-5].split('_')[1]
+	stuid = opath.parts[-4]
+	qid = opath.parts[-3]
+
+	bar.title(f'on {stuid}-{qid}')
+
+	if qid in correctiondict[stuid]:
+		cpath = correctiondict[stuid][qid]['path']
+		report = get_report(opath, cpath, vulturewldict[qid])
+		if report:
+			reports.append({
+				'user': stuid,
+				# 'qnum': qidtoqnum[qid],
+				'qid': qid,
+				# 'sect': correctiondict[stuid][qid]['section'],
+				# 'exam': examid,
+				'old': f'=HYPERLINK("{opath}")'
+				} | subreport(report, 'old') | {
+				'new': f'=HYPERLINK("{cpath}")'
+				} | subreport(report, 'new') | subreport(report, False))
+
+reportdf = pd.DataFrame(reports)
+reportdf['ratio'] = 1 - reportdf['edit_dist'] / reportdf[['old-#lines', 'new-#lines']].max(axis=1)
+reportdf['inspect'] = reportdf.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1)
+
+reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel('report_corrections.xlsx')
+
+# reportdf.pivot(index="user", columns="qnum").swaplevel(0, 1, axis=1).sort_index(1)['q2']
+
+df = originaldf.join(correctiondf).join(reportdf.set_index(['user', 'qid'])).reset_index(1)
+df['qnum'] = df['qid'].apply(lambda x: qidtoqnum[x])
+df['grade-new'] = pd.concat([df['grade-original'], df['grade-correction'] * df['ratio']], axis=1).max(axis=1)
+
+qnums = df['qnum'].unique()
+df = df.pivot(columns='qnum').swaplevel(0, 1, axis=1).sort_index(axis=1)
+df[('TOTAL', 'ORIGINAL')] = pd.concat((df[(qnum, 'grade-original')] for qnum in qnums), axis=1).mean(axis=1)
+df[('TOTAL', 'NEW')] = pd.concat((df[(qnum, 'grade-new')] for qnum in qnums), axis=1).mean(axis=1)
+df[('TOTAL', 'DELTA')] = df[('TOTAL', 'NEW')] - df[('TOTAL', 'ORIGINAL')]
+# df[('INFO', 'STUDENT ID')] = [studentinfodf.loc[user, 'studeintID'] if user in studentinfodf.index else 'MISSING' for user in df.index]
+df = df.join(studentinfodf)
+df.to_excel('report_full.xlsx')
+
+# 	return df, reportdf
 
 
-	# PREPARE REPORT
-	reports = []
-
-	for opath in (bar := alive_it(list(originalsdir.glob("*/*/*/src/Main.py")))):
-		examid = opath.parts[-5].split('_')[1]
-		stuid = opath.parts[-4]
-		qid = opath.parts[-3]
-
-		bar.title(f'on {stuid}-{qid}')
-
-		if qid in correctiondict[stuid]:
-			cpath = correctiondict[stuid][qid]['path']
-			report = get_report(opath, cpath, vulturewldict[qid])
-			if report:
-				reports.append({
-					'user': stuid,
-					'qid': qid,
-					'sect': correctiondict[stuid][qid]['section'],
-					'exam': examid,
-					'old': f'=HYPERLINK("{opath}")'
-					} | subreport(report, 'old') | {
-					'new': f'=HYPERLINK("{cpath}")'
-					} | subreport(report, 'new') | subreport(report, False))
-
-	df = pd.DataFrame(reports)
-	df['ratio'] = 1 - df['edit_dist'] / df[['old-#lines', 'new-#lines']].max(axis=1)
-	df['inspect'] = df.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1)
-	
-	df.to_excel('report_full.xlsx')
-	df[( c for c in df.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (df[c] != flawless[c]).any()) )].to_excel('report_summary.xlsx')
-	
-	return df
-
-
-if __name__ == '__main__':
-	df = main()
+# # if __name__ == '__main__':
+# df, reportdf = main()
