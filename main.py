@@ -345,7 +345,7 @@ def collect_gradebook(path, suffix):
 	if len(qlists := gradebook["Question Id List"].unique()) != 1:
 		print(f"Gradebook {path.name} contains multiple Question Id Lists: {qlists}")
 
-	return ({'user': f"user{r['User ID']}", 'qid': f"question{q}", f'grade-{suffix}': g}
+	return ({'user': f"user{r['User ID']}", 'qid': f"question{q}", f'grade-{suffix}': g, f'gbook-{suffix}': f'=HYPERLINK("{path}")'}
 			for i, r in gradebook.iterrows()
 			for q, g in zip(str(r["Question Id List"]).split(", "), r[gradecolumns]))
 
@@ -354,32 +354,39 @@ def collect_gradebook(path, suffix):
 coursehome = Path.home() / "Downloads/cmpe150fall2022"
 mthome = coursehome / "mt1"
 
-questiontars = mthome.glob("mt1questions/*.tar.gz")
-originaltars = mthome.glob("mt1originals/*.tar.gz")
-correctiontars = mthome.glob("mt1corrections/*/*.tar.gz")
+rawhome = mthome / "raw"
+rawquestionshome = rawhome / "questions"
+raworiginalshome = rawhome / "originals"
+rawcorrectionshome = rawhome / "corrections"
 
-questionsdir = Path("questions")
-originalsdir = Path("originals")
-correctionsdir = Path("corrections")
+processedhome = mthome / "processed"
+
+rawquestiontars = rawquestionshome.glob("*.tar.gz")
+raworiginaltars = raworiginalshome.glob("*.tar.gz")
+rawcorrectiontars = rawcorrectionshome.glob("*/*.tar.gz")
+
+processedquestionsdir = processedhome / "questions"
+processedoriginalsdir = processedhome / "originals"
+processedcorrectionsdir = processedhome / "corrections"
 
 # EXTRACT TARS
-tarsextract(questiontars, questionsdir)
-tarsextract(originaltars, originalsdir)
-tarsextract(correctiontars, correctionsdir)
+tarsextract(rawquestiontars, processedquestionsdir)
+tarsextract(raworiginaltars, processedoriginalsdir)
+tarsextract(rawcorrectiontars, processedcorrectionsdir)
 
 # PREPARE VULTURE WHITELISTS
-vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in questionsdir.iterdir()}
+vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in processedquestionsdir.iterdir()}
 
 # PREPARE POINTERS TO CORRECTIONS
 correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
-										for cpath in correctionsdir.glob("*/*/*/src/Main.py")))
+										for cpath in processedcorrectionsdir.glob("*/*/*/src/Main.py")))
 
 # COLLECT ORIGINAL GRADES
-originalgradebooks = mthome.glob("mt1originals/*.xlsx")
+originalgradebooks = raworiginalshome.glob("*.xlsx")
 originaldf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'original') for gb in originalgradebooks))).set_index(['user', 'qid'])
 
 # COLLECT CORRECTION GRADES
-correctiongradebooks = mthome.glob("mt1corrections/*/*.xlsx")
+correctiongradebooks = rawcorrectionshome.glob("*/*.xlsx")
 correctiondf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'correction') for gb in correctiongradebooks))).set_index(['user', 'qid'])
 
 # COLLECT STUDENT INFO
@@ -400,7 +407,7 @@ qidtoqnum = {
 	'question1296': 'q3'
 	}
 
-for opath in (bar := alive_it(list(originalsdir.glob("*/*/*/src/Main.py")))):
+for opath in (bar := alive_it(list(processedoriginalsdir.glob("*/*/*/src/Main.py")))):
 	examid = opath.parts[-5].split('_')[1]
 	stuid = opath.parts[-4]
 	qid = opath.parts[-3]
@@ -421,12 +428,19 @@ for opath in (bar := alive_it(list(originalsdir.glob("*/*/*/src/Main.py")))):
 				} | subreport(report, 'old') | {
 				'new': f'=HYPERLINK("{cpath}")'
 				} | subreport(report, 'new') | subreport(report, False))
+		else:
+			reports.append({
+				'user': stuid,
+				'qid': qid,
+				'old': f'=HYPERLINK("{opath}")',
+				'new': f'=HYPERLINK("{cpath}")'
+				})
 
 reportdf = pd.DataFrame(reports)
 reportdf['ratio'] = 1 - reportdf['edit_dist'] / reportdf[['old-#lines', 'new-#lines']].max(axis=1)
 reportdf['inspect'] = reportdf.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1)
 
-reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel('report_corrections.xlsx')
+reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel(mthome / 'report_corrections.xlsx')
 
 # reportdf.pivot(index="user", columns="qnum").swaplevel(0, 1, axis=1).sort_index(1)['q2']
 
@@ -441,7 +455,7 @@ df[('TOTAL', 'NEW')] = pd.concat((df[(qnum, 'grade-new')] for qnum in qnums), ax
 df[('TOTAL', 'DELTA')] = df[('TOTAL', 'NEW')] - df[('TOTAL', 'ORIGINAL')]
 # df[('INFO', 'STUDENT ID')] = [studentinfodf.loc[user, 'studeintID'] if user in studentinfodf.index else 'MISSING' for user in df.index]
 df = df.join(studentinfodf)
-df.to_excel('report_full.xlsx')
+df.to_excel(mthome / 'report_full.xlsx')
 
 # 	return df, reportdf
 
