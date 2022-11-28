@@ -29,12 +29,25 @@ def tarsextract(tars, outdir):
 		else:
 			return
 
-	os.mkdir(outdir)
+	os.makedirs(outdir)
 	for tar in tars:
-		tf = tarfile.open(tar)
-		for file in tf:
-			file.name = sanitize_filepath(file.name, replacement_text="_")
-		tf.extractall(outdir)
+		with tarfile.open(tar) as tf:
+			tfmembers = tf.getmembers()
+			with alive_bar(len(tfmembers)) as bar:
+				bar.title(f'sanitizing {tar.name}')
+				for file in tf:
+					file.name = sanitize_filepath(file.name, replacement_text="_")
+					bar()
+
+			tfmembers = tf.getmembers()
+			with alive_bar(len(tfmembers)) as bar:
+				bar.title(f'extracting {tar.name}')
+				def track_progress(members):
+					nonlocal bar
+					for member in members:
+						bar()
+						yield member
+				tf.extractall(outdir, members=track_progress(tfmembers))
 
 
 def join_triplequote_strings(code):
@@ -352,7 +365,7 @@ def collect_gradebook(path, suffix):
 
 # def main():
 coursehome = Path.home() / "Downloads/cmpe150fall2022"
-mthome = coursehome / "mt1"
+mthome = coursehome / "mt2"
 
 rawhome = mthome / "raw"
 rawquestionshome = rawhome / "questions"
