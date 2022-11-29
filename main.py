@@ -372,15 +372,19 @@ rawquestionshome = rawhome / "questions"
 raworiginalshome = rawhome / "originals"
 rawcorrectionshome = rawhome / "corrections"
 
-processedhome = mthome / "processed"
-
 rawquestiontars = rawquestionshome.glob("*.tar.gz")
 raworiginaltars = raworiginalshome.glob("*.tar.gz")
 rawcorrectiontars = rawcorrectionshome.glob("*/*.tar.gz")
 
+processedhome = mthome / "processed"
 processedquestionsdir = processedhome / "questions"
 processedoriginalsdir = processedhome / "originals"
 processedcorrectionsdir = processedhome / "corrections"
+
+patchhome = mthome / "patch"
+patchoriginalsdir = patchhome / "originals"
+patchcorrectionsdir = patchhome / "corrections"
+
 
 # EXTRACT TARS
 tarsextract(rawquestiontars, processedquestionsdir)
