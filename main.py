@@ -2,166 +2,157 @@ import re, os, shutil
 import click
 import tarfile
 from pathvalidate import sanitize_filepath
-import coverage
+# import coverage
 import edit_distance
-from collections import defaultdict
 from pylint.reporters.text import TextReporter
 from io import StringIO
 import tempfile
 import vulture
 import pandas as pd
-import itertools
+from itertools import chain, repeat
 import glob
 from pathlib import Path
 from contextlib import redirect_stderr
-from alive_progress import alive_bar, alive_it
+from alive_progress import alive_it
 import tokenize
-from time import sleep
 import mergedeep
-import ast
 import warnings
+from multiprocessing import Pool, cpu_count
+
+
+def tarextract(tar, outdir):
+	with tarfile.open(tar) as tf:
+		for file in tf:
+			file.name = sanitize_filepath(file.name, replacement_text="_")
+
+		tf.extractall(outdir)
 
 
 def tarsextract(tars, outdir):
-	if os.path.isdir(outdir):
-		if click.confirm(f"Directory '{outdir}' already exists, want to delete it and extract new?", default=False):
+	if outdir.is_dir():
+		if click.confirm(f"Directory '{outdir.relative_to(outdir.parents[3])}' already exists, want to delete it and extract new?", default=False):
 			shutil.rmtree(outdir)
 		else:
 			return
 
-	os.makedirs(outdir)
-	for tar in tars:
-		with tarfile.open(tar) as tf:
-			tfmembers = tf.getmembers()
-			with alive_bar(len(tfmembers)) as bar:
-				bar.title(f'sanitizing {tar.name}')
-				for file in tf:
-					file.name = sanitize_filepath(file.name, replacement_text="_")
-					bar()
+	outdir.mkdir(parents=True)
 
-			tfmembers = tf.getmembers()
-			with alive_bar(len(tfmembers)) as bar:
-				bar.title(f'extracting {tar.name}')
-				def track_progress(members):
-					nonlocal bar
-					for member in members:
-						bar()
-						yield member
-				tf.extractall(outdir, members=track_progress(tfmembers))
+	arguments = list(zip(tars, repeat(outdir)))
+	with Pool(min(cpu_count(), len(arguments))) as pool:
+		pool.starmap(tarextract, arguments)
 
 
-def join_triplequote_strings(code):
-	rline = ''
-	inquotes = False
-	for line in code:
-		rline += line
-		qactivity = True
-		while qactivity:
-			qactivity = False
+def sanitize(code, codepath, full=False):
+	resourceindicator = '/'.join(codepath.parts[-6:-2]) + (' (full)' if full else '')
+
+	def join_triplequote_strings(code):
+		rline = ''
+		inquotes = False
+		for line in code:
+			rline += line
+			qactivity = True
+			while qactivity:
+				qactivity = False
+				if inquotes:
+					qend = line.find(inquotes)
+					if qend != -1:
+						line = line[qend+len(inquotes):]
+						inquotes = False
+						qactivity = True
+				else:
+					qstart = sorted((s, q) for q in ["'''", '"""'] if (s := line.find(q)) != -1)
+					if qstart:
+						s, q = qstart[0]
+						line = line[s+len(q):]
+						inquotes = q
+						qactivity = True
 			if inquotes:
-				qend = line.find(inquotes)
-				if qend != -1:
-					line = line[qend+len(inquotes):]
-					inquotes = False
-					qactivity = True
+				if not rline.endswith('\\'):
+					rline += '\\n'
 			else:
-				qstart = sorted((s, q) for q in ["'''", '"""'] if (s := line.find(q)) != -1)
-				if qstart:
-					s, q = qstart[0]
-					line = line[s+len(q):]
-					inquotes = q
-					qactivity = True
-		if inquotes:
-			if not rline.endswith('\\'):
-				rline += '\\n'
-		else:
-			yield rline
-			rline = ''
+				yield rline
+				rline = ''
 
 
-def comment_index(line):
-	try:
-		comments = [x for x in tokenize.generate_tokens(StringIO(line).readline) if x[0] == tokenize.COMMENT]
-		return comments[0][2][1] if len(comments) == 1 else -1
-	except tokenize.TokenError as e:
-		if line.find('#') != -1:
-			sleep(10)
-			print("We have a # and:", str(e))
-		return -1
+	def comment_index(line):
+		try:
+			comments = [x for x in tokenize.generate_tokens(StringIO(line).readline) if x[0] == tokenize.COMMENT]
+			return comments[0][2][1] if len(comments) == 1 else -1
+		except tokenize.TokenError as e:
+			if line.find('#') != -1:
+				print(f"[{resourceindicator}] We have a # and:", str(e))
+			return -1
 
 
-def join_lines(code):
-	rline = ''
-	for line in code:
-		rline += line
-		if comment_index(line) == -1 and rline.endswith('\\'):
-			rline = rline[:-1]
-		else:
-			yield rline
-			rline = ''
+	def join_lines(code):
+		rline = ''
+		for line in code:
+			rline += line
+			if comment_index(line) == -1 and rline.endswith('\\'):
+				rline = rline[:-1]
+			else:
+				yield rline
+				rline = ''
 
 
-# def remove_triplequote_comments(code):
-# 	incomment = False
-# 	commenttype = ''
-# 	for line in code:
-# 		if incomment:
-# 			if line.find(commenttype * 3) >= 0:
-# 				incomment = False
-# 		else:
-# 			l = line
-# 			found_inline_comment = True
-# 			while found_inline_comment:
-# 				found_inline_comment = False
-# 				l = l.lstrip()
-# 				for ctype in ['"', "'"]:
-# 					if l.startswith(ctype * 3):
-# 						cend = l[3:].find(ctype * 3)
-# 						if cend == -1:
-# 							incomment = True
-# 							commenttype = ctype
-# 							break
-# 						else:
-# 							l = l[cend+6:]
-# 							found_inline_comment = True
-# 							break
-# 			if not incomment and l.strip() != '':
-# 				yield line
+	# def remove_triplequote_comments(code):
+	# 	incomment = False
+	# 	commenttype = ''
+	# 	for line in code:
+	# 		if incomment:
+	# 			if line.find(commenttype * 3) >= 0:
+	# 				incomment = False
+	# 		else:
+	# 			l = line
+	# 			found_inline_comment = True
+	# 			while found_inline_comment:
+	# 				found_inline_comment = False
+	# 				l = l.lstrip()
+	# 				for ctype in ['"', "'"]:
+	# 					if l.startswith(ctype * 3):
+	# 						cend = l[3:].find(ctype * 3)
+	# 						if cend == -1:
+	# 							incomment = True
+	# 							commenttype = ctype
+	# 							break
+	# 						else:
+	# 							l = l[cend+6:]
+	# 							found_inline_comment = True
+	# 							break
+	# 			if not incomment and l.strip() != '':
+	# 				yield line
 
 
-def remove_quote_comments(code):
-	for line in code:
-		l = line.strip()
-		repeat = True
-		while repeat:
-			repeat = False
-			for q in ["'''", '"""', "'", '"']:
-				if l.startswith(q):
-					qend = l.find(q, len(q))
-					if qend == -1:
-						sleep(10)
-						print(f"Quotes left unclosed! Full line: >{line}< and rest of the line >{l}")
+	def remove_quote_comments(code):
+		for line in code:
+			l = line.strip()
+			repeat = True
+			while repeat:
+				repeat = False
+				for q in ["'''", '"""', "'", '"']:
+					if l.startswith(q):
+						qend = l.find(q, len(q))
+						if qend == -1:
+							print(f"[{resourceindicator}] Quotes left unclosed! Full line: >{line}< and rest of the line >{l}")
+							break
+						l = l[qend+len(q):].lstrip()
+						repeat = True
 						break
-					l = l[qend+len(q):].lstrip()
-					repeat = True
-					break
-		if l != '':
-			yield line
+			if l != '':
+				yield line
 
 
-def remove_comments(code):
-	return (line if (ci := comment_index(line)) == -1 else line[:ci] for line in code)
+	def remove_comments(code):
+		return (line if (ci := comment_index(line)) == -1 else line[:ci] for line in code)
 
 
-def rstrip(code):
-	return (line.rstrip(" \t\n\r;") for line in code)
+	def rstrip(code):
+		return (line.rstrip(" \t\n\r;") for line in code)
 
 
-def remove_empty_lines(code):
-	return (line for line in code if line != '')
+	def remove_empty_lines(code):
+		return (line for line in code if line != '')
 
-
-def sanitize(code):
 	return list(remove_empty_lines(rstrip(remove_comments(remove_quote_comments(join_lines(join_triplequote_strings(code)))))))
 
 
@@ -264,85 +255,169 @@ def num_semicolon(code):
 
 
 def num_comma(code):
-	return len(re.findall(r""",\s*(?!"|'|\s|end\s*=)""", '\n'.join(code)))
+	def num_comma_in_line(line):
+		try:
+			count = 0
+			comma_counting_at_level = [True]
+			may_start_function = False
+
+			for token in tokenize.generate_tokens(StringIO(line).readline):
+				if token.type == tokenize.OP:
+					if token.string == ',' and comma_counting_at_level[-1]:
+						count += 1
+					elif token.string == '(':
+						comma_counting_at_level.append(not may_start_function)
+					elif token.string == ')':
+						comma_counting_at_level.pop()
+				may_start_function = token.type == tokenize.NAME
+			return count
+		except tokenize.TokenError as e:
+			return line.count(',') # len(re.findall(r""",\s*(?!"|'|\s|end\s*=)""", line))
+
+	return sum(num_comma_in_line(line) for line in code)
 
 
 def num_exec(code):
 	return '\n'.join(code).count('exec(')
 
 
-class MultiAssignCountVisitor(ast.NodeVisitor):
-	def __init__(self, *args, **kwargs):
-		super().__init__(*args, **kwargs)
-		self.count = 0
+def num_global_nonlocal(code):
+	return '\n'.join(code).count('global') + '\n'.join(code).count('nonlocal')
 
-	def visit_Assign(self, node):
-		if len(node.targets) > 1 or any(type(t) is ast.Tuple for t in node.targets):
-			self.count += 1
+
+def num_ternary(code):
+	return sum(len(re.findall(r"""\bif\b.*\belse\b""", line)) for line in code)
 
 
 def num_multi_assign(code):
-	macv = MultiAssignCountVisitor()
-	ap = ast.parse('\n'.join(code))
-	macv.visit(ap)
-	return macv.count
+	return sum(max(0, len(re.findall(r"""[^=!+\-*\^\|&<>%/]=[^=]""", line)) - 1) for line in code)
 
 
-def num_multi_assign_naive(code):
-	return sum(0 if (eqidx := line.find('=')) == -1 else line[:eqidx].count(',') for line in code)
+def num_self_assign(code):
+	return sum(1 if re.match(r"""^\s*(\w+)\s*=\s*\1\s*$""", line) else 0 for line in code)
+
+
+def num_empty_string_return(code):
+	return sum(1 if re.match(r"""^\s*return\s*("\s*"|'\s*'|\("\s*"\)|\('\s*'\))\s*$""", line) else 0 for line in code)
+
+
+def num_silly_and_or(code):
+	aoexp = r"""\b(and|or)\b"""
+	strexp = r"""\s*("[^"]*"|'[^']*')\s*"""
+	rendexp = r"""(:|\)|\bor\b|\band\b)"""
+	lendexp = r"""(if\b|\(|\bor\b|\band\b|^\s*)"""
+	return sum(len(re.findall(aoexp + strexp + rendexp + "|" + lendexp + strexp + aoexp, line)) for line in code)
+
+
+def num_stray_and_or(code):
+	return sum(len(re.findall(r"""^(?:(?!if)(?!while).)*?\b(and|or)\b.*""", line)) for line in code)
+
+
+# class MultiAssignCountVisitor(ast.NodeVisitor):
+# 	def __init__(self, *args, **kwargs):
+# 		super().__init__(*args, **kwargs)
+# 		self.count = 0
+
+# 	def visit_Assign(self, node):
+# 		if len(node.targets) > 1 or any(type(t) is ast.Tuple for t in node.targets):
+# 			self.count += 1
+
+
+# def num_multi_assign(code):
+# 	macv = MultiAssignCountVisitor()
+# 	ap = ast.parse('\n'.join(code))
+# 	macv.visit(ap)
+# 	return macv.count
+
+
+# def num_multi_assign_naive(code):
+# 	return sum(0 if (eqidx := line.find('=')) == -1 else line[:eqidx].count(',') for line in code)
 
 
 flawless = {
-	'old-#colfol': 0,
-	'old-#semcol': 0,
-	'old-#comma': 0,
-	'old-#exec': 0,
-	# 'old-#mulas': 0,
-	'old-flagOK': True,
-	'old-pylint': True,
-	'old-vultur': True,
-	'new-#colfol': 0,
-	'new-#semcol': 0,
-	'new-#comma': 0,
-	'new-#exec': 0,
-	# 'new-#mulas': 0,
-	'new-flagOK': True,
-	'new-pylint': True,
-	'new-vultur': True
+	'org-#colfol': 0,
+	'org-#semcol': 0,
+	'org-#comma': 0,
+	'org-#exec': 0,
+	'org-#mulas': 0,
+	'org-#globl': 0,
+	'org-#tern': 0,
+	'org-#selas': 0,
+	'org-#esret': 0,
+	'org-#silao': 0,
+	'cor-#sryao': 0,
+	'org-flagOK': True,
+	'org-pylint': True,
+	'org-vultur': True,
+	'cor-#colfol': 0,
+	'cor-#semcol': 0,
+	'cor-#comma': 0,
+	'cor-#exec': 0,
+	'cor-#mulas': 0,
+	'cor-#globl': 0,
+	'cor-#tern': 0,
+	'cor-#selas': 0,
+	'cor-#esret': 0,
+	'cor-#silao': 0,
+	'cor-#sryao': 0,
+	'cor-flagOK': True,
+	'cor-pylint': True,
+	'cor-vultur': True
 	}
 
 
-def get_report(oldpath, newpath, vulturewlpath, should_sanitize=True):
-	with open(oldpath) as oldfile:
-		oldfull = oldfile.read().splitlines()
-		old, oldgoodflags = extract_user_code(oldfull)
-	with open(newpath) as newfile:
-		newfull = newfile.read().splitlines()
-		new, newgoodflags = extract_user_code(newfull)
-	if should_sanitize:
-		oldfull = sanitize(oldfull)
-		newfull = sanitize(newfull)
-		old = sanitize(old)
-		new = sanitize(new)
+def get_flaws(report):
+	return ', '.join(k for k in flawless if k in report and flawless[k] != report[k])
 
-	return len(new) > 0 and {
-	'edit_dist': calculate_edit_distance(old, new),
-	'old-#lines' : len(old),
-	'old-#colfol': num_colon_follow(old),
-	'old-#semcol': num_semicolon(old),
-	'old-#comma': num_comma(old),
-	'old-#exec': num_exec(old),
-	# 'old-#mulas': num_multi_assign_naive(old),
-	'old-flagOK': oldgoodflags,
-	} | run_tests(oldfull, vulturewlpath, 'old') | {
-	'new-#lines': len(new),
-	'new-#colfol': num_colon_follow(new),
-	'new-#semcol': num_semicolon(new),
-	'new-#comma': num_comma(new),
-	'new-#exec': num_exec(new),
-	# 'new-#mulas': num_multi_assign_naive(new),
-	'new-flagOK': newgoodflags
-	} | run_tests(newfull, vulturewlpath, 'new')
+
+def get_report(orgpath, corpath, vulturewlpath, should_sanitize=True):
+	with open(orgpath) as orgfile:
+		orgfull = orgfile.read().splitlines()
+		org, orggoodflags = extract_user_code(orgfull)
+	with open(corpath) as corfile:
+		corfull = corfile.read().splitlines()
+		cor, corgoodflags = extract_user_code(corfull)
+	if should_sanitize:
+		orgfull = sanitize(orgfull, orgpath, True)
+		corfull = sanitize(corfull, corpath, True)
+		org = sanitize(org, orgpath)
+		cor = sanitize(cor, corpath)
+
+	if len(cor) > 0:
+		orgreport = {
+			'org-#lines' : len(org),
+			'org-#colfol': num_colon_follow(org),
+			'org-#semcol': num_semicolon(org),
+			'org-#comma': num_comma(org),
+			'org-#exec': num_exec(org),
+			'org-#mulas': num_multi_assign(org),
+			'org-#globl': num_global_nonlocal(org),
+			'org-#tern': num_ternary(org),
+			'org-#selas': num_self_assign(org),
+			'org-#esret': num_empty_string_return(org),
+			'org-#silao': num_silly_and_or(org),
+			'org-#sryao': num_stray_and_or(org),
+			'org-flagOK': orggoodflags,
+			} | run_tests(orgfull, vulturewlpath, 'org')
+		correport = {
+			'cor-#lines': len(cor),
+			'cor-#colfol': num_colon_follow(cor),
+			'cor-#semcol': num_semicolon(cor),
+			'cor-#comma': num_comma(cor),
+			'cor-#exec': num_exec(cor),
+			'cor-#mulas': num_multi_assign(cor),
+			'cor-#globl': num_global_nonlocal(cor),
+			'cor-#tern': num_ternary(cor),
+			'cor-#selas': num_self_assign(cor),
+			'cor-#esret': num_empty_string_return(cor),
+			'cor-#silao': num_silly_and_or(cor),
+			'cor-#sryao': num_stray_and_or(cor),
+			'cor-flagOK': corgoodflags
+			} | run_tests(corfull, vulturewlpath, 'cor')
+		report = {'edit_dist': calculate_edit_distance(org, cor)} | orgreport | correport
+		return report, get_flaws(orgreport) == "", get_flaws(correport) == ""
+	else:
+		return False
 
 
 def subreport(report, tag):
@@ -363,119 +438,188 @@ def collect_gradebook(path, suffix):
 			for q, g in zip(str(r["Question Id List"]).split(", "), r[gradecolumns]))
 
 
-# def main():
-coursehome = Path.home() / "Downloads/cmpe150fall2022"
-mthome = coursehome / "mt2"
-
-rawhome = mthome / "raw"
-rawquestionshome = rawhome / "questions"
-raworiginalshome = rawhome / "originals"
-rawcorrectionshome = rawhome / "corrections"
-
-rawquestiontars = rawquestionshome.glob("*.tar.gz")
-raworiginaltars = raworiginalshome.glob("*.tar.gz")
-rawcorrectiontars = rawcorrectionshome.glob("*/*.tar.gz")
-
-processedhome = mthome / "processed"
-processedquestionsdir = processedhome / "questions"
-processedoriginalsdir = processedhome / "originals"
-processedcorrectionsdir = processedhome / "corrections"
-
-patchhome = mthome / "patch"
-patchoriginalsdir = patchhome / "originals"
-patchcorrectionsdir = patchhome / "corrections"
+def patchpath(patchdir, stuid, qid):
+	return patchdir / stuid / qid / "src/Main.py"
 
 
-# EXTRACT TARS
-tarsextract(rawquestiontars, processedquestionsdir)
-tarsextract(raworiginaltars, processedoriginalsdir)
-tarsextract(rawcorrectiontars, processedcorrectionsdir)
+def patchifexists(patchdir, stuid, qid):
+	ppath = patchpath(patchdir, stuid, qid)
+	return ppath.is_file() and ppath
 
-# PREPARE VULTURE WHITELISTS
-vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in processedquestionsdir.iterdir()}
 
-# PREPARE POINTERS TO CORRECTIONS
-correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
-										for cpath in processedcorrectionsdir.glob("*/*/*/src/Main.py")))
-
-# COLLECT ORIGINAL GRADES
-originalgradebooks = raworiginalshome.glob("*.xlsx")
-originaldf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'original') for gb in originalgradebooks))).set_index(['user', 'qid'])
-
-# COLLECT CORRECTION GRADES
-correctiongradebooks = rawcorrectionshome.glob("*/*.xlsx")
-correctiondf = pd.DataFrame(itertools.chain(*(collect_gradebook(gb, 'correction') for gb in correctiongradebooks))).set_index(['user', 'qid'])
-
-# COLLECT STUDENT INFO
-studentinfodf = pd.read_excel(coursehome / 'studentinfo.xlsx')
-studentinfodf['user'] = ['user' + str(x) for x in studentinfodf['user']]
-studentinfodf = studentinfodf.set_index('user')
-studentinfodf.columns = pd.MultiIndex.from_product([['INFO'], studentinfodf.columns])
-
-# PREPARE REPORT
-reports = []
-
-qidtoqnum = {
-	'question1291': 'q1',
-	'question1292': 'q1',
-	'question1293': 'q2',
-	'question1294': 'q2',
-	'question1295': 'q3',
-	'question1296': 'q3'
-	}
-
-for opath in (bar := alive_it(list(processedoriginalsdir.glob("*/*/*/src/Main.py")))):
-	examid = opath.parts[-5].split('_')[1]
-	stuid = opath.parts[-4]
-	qid = opath.parts[-3]
-
-	bar.title(f'on {stuid}-{qid}')
-
-	if qid in correctiondict[stuid]:
-		cpath = correctiondict[stuid][qid]['path']
-		report = get_report(opath, cpath, vulturewldict[qid])
+def analyze_stuq(examid, stuid, oqid, cpath, opath, reportworthy, vulturewlpath, patchcpath, patchopath):
+	if reportworthy:
+		report, orgtestperfect, cortestperfect = get_report(opath, cpath, vulturewlpath)
 		if report:
-			reports.append({
+			if not (orgtestperfect or (patchopath.exists() and opath.samefile(patchopath))):
+				patchopath.parent.mkdir(parents=True)
+				shutil.copyfile(opath, patchopath)
+				opath = patchopath
+			if not (cortestperfect or (patchcpath.exists() and cpath.samefile(patchcpath))):
+				patchcpath.parent.mkdir(parents=True)
+				shutil.copyfile(cpath, patchcpath)
+				cpath = patchcpath
+			return {
 				'user': stuid,
-				# 'qnum': qidtoqnum[qid],
-				'qid': qid,
-				# 'sect': correctiondict[stuid][qid]['section'],
+				# 'qnum': ns.origqiddict[oqid]['qnum'],
+				'qid': oqid,
+				# 'sect': ns.correctiondict[stuid][oqid]['section'],
 				# 'exam': examid,
-				'old': f'=HYPERLINK("{opath}")'
-				} | subreport(report, 'old') | {
-				'new': f'=HYPERLINK("{cpath}")'
-				} | subreport(report, 'new') | subreport(report, False))
-		else:
-			reports.append({
-				'user': stuid,
-				'qid': qid,
-				'old': f'=HYPERLINK("{opath}")',
-				'new': f'=HYPERLINK("{cpath}")'
-				})
+				'org': f'=HYPERLINK("{opath}")'
+				} | subreport(report, 'org') | {
+				'cor': f'=HYPERLINK("{cpath}")'
+				} | subreport(report, 'cor') | subreport(report, False)
 
-reportdf = pd.DataFrame(reports)
-reportdf['ratio'] = 1 - reportdf['edit_dist'] / reportdf[['old-#lines', 'new-#lines']].max(axis=1)
-reportdf['inspect'] = reportdf.apply(lambda r: ', '.join(c for c in flawless if flawless[c] != r[c]), axis=1)
-
-reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel(mthome / 'report_corrections.xlsx')
-
-# reportdf.pivot(index="user", columns="qnum").swaplevel(0, 1, axis=1).sort_index(1)['q2']
-
-df = originaldf.join(correctiondf).join(reportdf.set_index(['user', 'qid'])).reset_index(1)
-df['qnum'] = df['qid'].apply(lambda x: qidtoqnum[x])
-df['grade-new'] = pd.concat([df['grade-original'], df['grade-correction'] * df['ratio']], axis=1).max(axis=1)
-
-qnums = df['qnum'].unique()
-df = df.pivot(columns='qnum').swaplevel(0, 1, axis=1).sort_index(axis=1)
-df[('TOTAL', 'ORIGINAL')] = pd.concat((df[(qnum, 'grade-original')] for qnum in qnums), axis=1).mean(axis=1)
-df[('TOTAL', 'NEW')] = pd.concat((df[(qnum, 'grade-new')] for qnum in qnums), axis=1).mean(axis=1)
-df[('TOTAL', 'DELTA')] = df[('TOTAL', 'NEW')] - df[('TOTAL', 'ORIGINAL')]
-# df[('INFO', 'STUDENT ID')] = [studentinfodf.loc[user, 'studeintID'] if user in studentinfodf.index else 'MISSING' for user in df.index]
-df = df.join(studentinfodf)
-df.to_excel(mthome / 'report_full.xlsx')
-
-# 	return df, reportdf
+	return {
+		'user': stuid,
+		'qid': oqid,
+		'org': f'=HYPERLINK("{opath}")',
+		'cor': f'=HYPERLINK("{cpath}")'
+		}
 
 
-# # if __name__ == '__main__':
-# df, reportdf = main()
+
+if __name__ == '__main__':
+	CURRENT_EXAM = 2
+
+	coursehome = Path.home() / "Downloads/cmpe150fall2022"
+
+	if CURRENT_EXAM == 1:
+		mthome = coursehome / "mt1"
+		have_legitrange = False
+		origqiddict = {
+			'question1291': {'qnum': 'q1', 'corrid': 'question1291'},
+			'question1292': {'qnum': 'q1', 'corrid': 'question1292'},
+			'question1293': {'qnum': 'q2', 'corrid': 'question1293'},
+			'question1294': {'qnum': 'q2', 'corrid': 'question1294'},
+			'question1295': {'qnum': 'q3', 'corrid': 'question1295'},
+			'question1296': {'qnum': 'q3', 'corrid': 'question1296'}
+			}
+	elif CURRENT_EXAM == 2:
+		mthome = coursehome / "mt2"
+		have_legitrange = True
+		origqiddict = {
+			'question1327': {'qnum': 'q1', 'corrid': 'question1336', 'legitrange': (6, 15)},
+			'question1328': {'qnum': 'q2', 'corrid': 'question1337', 'legitrange': (11, 25)},
+			'question1329': {'qnum': 'q3', 'corrid': 'question1338', 'legitrange': (8, 20)},
+			'question1330': {'qnum': 'q1', 'corrid': 'question1339', 'legitrange': (6, 15)},
+			'question1331': {'qnum': 'q2', 'corrid': 'question1340', 'legitrange': (11, 25)},
+			'question1332': {'qnum': 'q3', 'corrid': 'question1341', 'legitrange': (8, 20)}
+			}
+
+	corrqiddict = {v['corrid'] : {'qnum': v['qnum'], 'origid': oqid} for oqid, v in origqiddict.items()}
+
+	rawhome = mthome / "raw"
+	rawquestionshome = rawhome / "questions"
+	raworiginalshome = rawhome / "originals"
+	rawcorrectionshome = rawhome / "corrections"
+
+	rawquestiontars = rawquestionshome.glob("*.tar.gz")
+	raworiginaltars = raworiginalshome.glob("*.tar.gz")
+	rawcorrectiontars = rawcorrectionshome.glob("*/*.tar.gz")
+
+	processedhome = mthome / "processed"
+	processedquestionsdir = processedhome / "questions"
+	processedoriginalsdir = processedhome / "originals"
+	processedcorrectionsdir = processedhome / "corrections"
+
+	patchhome = mthome / "patch"
+	patchoriginalsdir = patchhome / "originals"
+	patchcorrectionsdir = patchhome / "corrections"
+
+
+	# EXTRACT TARS
+	tarsextract(rawquestiontars, processedquestionsdir)
+	tarsextract(raworiginaltars, processedoriginalsdir)
+	tarsextract(rawcorrectiontars, processedcorrectionsdir)
+
+	# PREPARE VULTURE WHITELISTS
+	vulturewldict = {qdir.name : prepare_vulture_whitelist(qdir / 'src/Main.py') for qdir in processedquestionsdir.iterdir()}
+
+	# PREPARE POINTERS TO CORRECTIONS
+	correctiondict = mergedeep.merge({}, *({ cpath.parts[-4] : { cpath.parts[-3] : { 'path': cpath, 'section': cpath.parts[-5].split('_')[1] } } }
+											for cpath in processedcorrectionsdir.glob("*/*/*/src/Main.py")))
+
+	# COLLECT ORIGINAL GRADES
+	originalgradebooks = raworiginalshome.glob("*.xlsx")
+	originaldf = pd.DataFrame(chain(*(collect_gradebook(gb, 'org') for gb in originalgradebooks))).set_index(['user', 'qid']).sort_index()
+
+	# COLLECT CORRECTION GRADES
+	correctiongradebooks = rawcorrectionshome.glob("*/*.xlsx")
+	correctiondf = pd.DataFrame(chain(*(collect_gradebook(gb, 'cor') for gb in correctiongradebooks)))
+	correctiondf['qid'] = correctiondf['qid'].apply(lambda x: corrqiddict[x]['origid'])
+	correctiondf = correctiondf.set_index(['user', 'qid']).sort_index()
+	for pcgpath in patchcorrectionsdir.glob("*/*/src/grade.txt"):
+		with open(pcgpath) as pcgf:
+			correctiondf.loc[(pcgpath.parts[-4], pcgpath.parts[-3]), 'grade-cor'] = int(pcgf.readline())
+	correctiondf = correctiondf.sort_values('grade-cor', ascending=False).groupby(['user', 'qid']).first().sort_index()
+
+	# COLLECT STUDENT INFO
+	studentinfodf = pd.read_excel(coursehome / 'studentinfo.xlsx')
+	studentinfodf['user'] = ['user' + str(x) for x in studentinfodf['user']]
+	studentinfodf = studentinfodf.set_index('user')
+	studentinfodf.columns = pd.MultiIndex.from_product([['INFO'], studentinfodf.columns])
+
+	# PREPARE REPORT
+
+	with Pool() as pool:
+		opaths = list(processedoriginalsdir.glob("*/*/*/src/Main.py"))
+		def produce_arguments():
+			for opath in (bar := alive_it(opaths)):
+				examid = opath.parts[-5].split('_')[1]
+				stuid = opath.parts[-4]
+				oqid = opath.parts[-3]
+				cqid = origqiddict[oqid]['corrid']
+
+				bar.title(f'on {stuid}-{oqid}')
+
+				if cqid in correctiondict[stuid]:
+					if patchifexists(patchcorrectionsdir, stuid, cqid):
+						with open(patchpath(patchcorrectionsdir, stuid, cqid).parent / 'backref.txt', "w") as bref:
+							bref.write(str(correctiondict[stuid][cqid]['path']))
+					if patchifexists(patchoriginalsdir, stuid, oqid):
+						with open(patchpath(patchoriginalsdir, stuid, oqid).parent / 'backref.txt', "w") as bref:
+							bref.write(str(opath))
+					cpath = patchifexists(patchcorrectionsdir, stuid, cqid) or correctiondict[stuid][cqid]['path']
+					opath = patchifexists(patchoriginalsdir, stuid, oqid) or opath
+
+					reportworthy = (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
+
+					yield examid, stuid, oqid, cpath, opath, reportworthy, vulturewldict[oqid], patchpath(patchcorrectionsdir, stuid, cqid), patchpath(patchoriginalsdir, stuid, oqid)
+
+		# arguments = list(produce_arguments())
+		# results = pool.starmap(analyze_stuq, tqdm(arguments))
+		results = pool.starmap(analyze_stuq, produce_arguments())
+
+		reportdf = pd.DataFrame(results)
+
+	if have_legitrange:
+		reportdf['ratio'] = reportdf.apply(lambda r: 1 if r['edit_dist'] == 0 else max(0, min(
+			1 - r['edit_dist'] / min(max(r['org-#lines'], r['cor-#lines']), origqiddict[r['qid']]['legitrange'][1]),
+			(max(r['org-#lines'], r['cor-#lines']) - r['edit_dist']) / max(r['org-#lines'], r['cor-#lines'], origqiddict[r['qid']]['legitrange'][0])
+			)), axis=1)
+		# reportdf['ratio'] = np.where(reportdf['edit_dist'] == 0, 1, pd.concat((1 - reportdf['edit_dist'] / reportdf[['org-#lines', 'cor-#lines']].assign(legitmax=.max(axis=1))
+	else:
+		reportdf['ratio'] = 1 - reportdf['edit_dist'] / reportdf[['org-#lines', 'cor-#lines']].max(axis=1)
+
+	for pf in ('org', 'cor'):
+		reportdf[f'{pf}-inspect'] = reportdf[[c for c in reportdf.columns if c.startswith(pf)]].apply(get_flaws, axis=1)
+	reportdf['all-inspect'] = reportdf.apply(get_flaws, axis=1)
+
+	reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel(mthome / 'report_corrections.xlsx')
+
+	# reportdf.pivot(index="user", columns="qnum").swaplevel(0, 1, axis=1).sort_index(1)['q2']
+
+	df = originaldf.join(correctiondf).join(reportdf.set_index(['user', 'qid'])).reset_index(1)
+	df['qnum'] = df['qid'].apply(lambda x: origqiddict[x]['qnum'])
+	df['grade-new'] = pd.concat([df['grade-org'], df['grade-cor'] * df['ratio']], axis=1).max(axis=1)
+
+	qnums = df['qnum'].unique()
+	df = df.pivot(columns='qnum').swaplevel(0, 1, axis=1).sort_index(axis=1)
+	df[('TOTAL', 'ORIGINAL')] = pd.concat((df[(qnum, 'grade-org')] for qnum in qnums), axis=1).mean(axis=1)
+	df[('TOTAL', 'NEW')] = pd.concat((df[(qnum, 'grade-new')] for qnum in qnums), axis=1).mean(axis=1)
+	df[('TOTAL', 'DELTA')] = df[('TOTAL', 'NEW')] - df[('TOTAL', 'ORIGINAL')]
+	# df[('INFO', 'STUDENT ID')] = [studentinfodf.loc[user, 'studeintID'] if user in studentinfodf.index else 'MISSING' for user in df.index]
+	df = df.join(studentinfodf)
+	df.to_excel(mthome / 'report_full.xlsx')
+
