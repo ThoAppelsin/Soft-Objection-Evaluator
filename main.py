@@ -18,6 +18,8 @@ import tokenize
 import mergedeep
 import warnings
 from multiprocessing import Pool, cpu_count
+import openpyxl
+from copy import copy
 
 
 def tarextract(tar, outdir):
@@ -449,8 +451,9 @@ def patchifexists(patchdir, stuid, qid):
 
 def analyze_stuq(examid, stuid, oqid, cpath, opath, reportworthy, vulturewlpath, patchcpath, patchopath):
 	if reportworthy:
-		report, orgtestperfect, cortestperfect = get_report(opath, cpath, vulturewlpath)
-		if report:
+		reportpack = get_report(opath, cpath, vulturewlpath)
+		if reportpack:
+			report, orgtestperfect, cortestperfect = reportpack
 			if not (orgtestperfect or (patchopath.exists() and opath.samefile(patchopath))):
 				patchopath.parent.mkdir(parents=True)
 				shutil.copyfile(opath, patchopath)
@@ -478,14 +481,27 @@ def analyze_stuq(examid, stuid, oqid, cpath, opath, reportworthy, vulturewlpath,
 		}
 
 
+def format_excel(path, freezerows, freezecolumns):
+	wb = openpyxl.load_workbook(filename=path)
+	ws = wb.active
+	ws.freeze_panes = f"{openpyxl.utils.get_column_letter(freezecolumns + 1)}{freezerows + 1}"
+	for row in ws.iter_rows(1, ws.max_row, 1, ws.max_column):
+		for cell in row:
+			alignmentstyle = copy(cell.alignment)
+			alignmentstyle.shrinkToFit = True
+			cell.alignment = alignmentstyle
+	ws.auto_filter.ref = f"A{freezerows}:{openpyxl.utils.get_column_letter(ws.max_column)}{ws.max_row}"
+	wb.save(path)
+
+
 
 if __name__ == '__main__':
-	CURRENT_EXAM = 2
+	CURRENT_EXAM = 1
 
 	coursehome = Path.home() / "Downloads/cmpe150fall2022"
 
 	if CURRENT_EXAM == 1:
-		mthome = coursehome / "mt1"
+		examname = "mt1"
 		have_legitrange = False
 		origqiddict = {
 			'question1291': {'qnum': 'q1', 'corrid': 'question1291'},
@@ -496,7 +512,7 @@ if __name__ == '__main__':
 			'question1296': {'qnum': 'q3', 'corrid': 'question1296'}
 			}
 	elif CURRENT_EXAM == 2:
-		mthome = coursehome / "mt2"
+		examname = "mt2"
 		have_legitrange = True
 		origqiddict = {
 			'question1327': {'qnum': 'q1', 'corrid': 'question1336', 'legitrange': (6, 15)},
@@ -509,7 +525,9 @@ if __name__ == '__main__':
 
 	corrqiddict = {v['corrid'] : {'qnum': v['qnum'], 'origid': oqid} for oqid, v in origqiddict.items()}
 
-	rawhome = mthome / "raw"
+	examhome = coursehome / examname
+
+	rawhome = examhome / "raw"
 	rawquestionshome = rawhome / "questions"
 	raworiginalshome = rawhome / "originals"
 	rawcorrectionshome = rawhome / "corrections"
@@ -518,12 +536,12 @@ if __name__ == '__main__':
 	raworiginaltars = raworiginalshome.glob("*.tar.gz")
 	rawcorrectiontars = rawcorrectionshome.glob("*/*.tar.gz")
 
-	processedhome = mthome / "processed"
+	processedhome = examhome / "processed"
 	processedquestionsdir = processedhome / "questions"
 	processedoriginalsdir = processedhome / "originals"
 	processedcorrectionsdir = processedhome / "corrections"
 
-	patchhome = mthome / "patch"
+	patchhome = examhome / "patch"
 	patchoriginalsdir = patchhome / "originals"
 	patchcorrectionsdir = patchhome / "corrections"
 
@@ -583,7 +601,7 @@ if __name__ == '__main__':
 					cpath = patchifexists(patchcorrectionsdir, stuid, cqid) or correctiondict[stuid][cqid]['path']
 					opath = patchifexists(patchoriginalsdir, stuid, oqid) or opath
 
-					reportworthy = (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
+					reportworthy = True # (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
 
 					yield examid, stuid, oqid, cpath, opath, reportworthy, vulturewldict[oqid], patchpath(patchcorrectionsdir, stuid, cqid), patchpath(patchoriginalsdir, stuid, oqid)
 
@@ -606,7 +624,9 @@ if __name__ == '__main__':
 		reportdf[f'{pf}-inspect'] = reportdf[[c for c in reportdf.columns if c.startswith(pf)]].apply(get_flaws, axis=1)
 	reportdf['all-inspect'] = reportdf.apply(get_flaws, axis=1)
 
-	reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel(mthome / 'report_corrections.xlsx')
+	reportcorrectionspath = examhome / f'report_corrections_{examname}.xlsx'
+	reportdf[( c for c in reportdf.columns if c not in ['qid', 'sect', 'exam'] and (c not in flawless or (reportdf[c] != flawless[c]).any()) )].to_excel(reportcorrectionspath)
+	format_excel(reportcorrectionspath, 1, 1)
 
 	# reportdf.pivot(index="user", columns="qnum").swaplevel(0, 1, axis=1).sort_index(1)['q2']
 
@@ -621,5 +641,8 @@ if __name__ == '__main__':
 	df[('TOTAL', 'DELTA')] = df[('TOTAL', 'NEW')] - df[('TOTAL', 'ORIGINAL')]
 	# df[('INFO', 'STUDENT ID')] = [studentinfodf.loc[user, 'studeintID'] if user in studentinfodf.index else 'MISSING' for user in df.index]
 	df = df.join(studentinfodf)
-	df.to_excel(mthome / 'report_full.xlsx')
 
+	reportfullpath = examhome / f'report_full_{examname}.xlsx'
+	df.to_excel(reportfullpath)
+
+	format_excel(reportfullpath, 3, 1)
