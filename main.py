@@ -440,37 +440,42 @@ def collect_gradebook(path, suffix):
 			for q, g in zip(str(r["Question Id List"]).split(", "), r[gradecolumns]))
 
 
-def patchpath(patchdir, stuid, qid):
-	return patchdir / stuid / qid / "src/Main.py"
+def create_nppath_backref(ppath, nppath):
+	brefpath = ppath.parent / 'backref.txt'
+	with open(brefpath, "w") as bref:
+		bref.write(str(nppath))
 
 
-def patchifexists(patchdir, stuid, qid):
-	ppath = patchpath(patchdir, stuid, qid)
-	return ppath.is_file() and ppath
+def consider_creating_patch(isperfect, ppath, path):
+	if isperfect or (ppath.exists() and path.samefile(ppath)):
+		return path
+
+	ppath.parent.mkdir(parents=True)
+	shutil.copyfile(path, ppath)
+	create_nppath_backref(ppath, path)
+	return ppath
 
 
-def analyze_stuq(examid, stuid, oqid, cpath, opath, reportworthy, vulturewlpath, patchcpath, patchopath):
+def analyze_stuq(examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewlpath):
 	if reportworthy:
+		opath = popath if popath.is_file() else npopath
+		cpath = pcpath if pcpath.is_file() else npcpath
 		reportpack = get_report(opath, cpath, vulturewlpath)
 		if reportpack:
 			report, orgtestperfect, cortestperfect = reportpack
-			if not (orgtestperfect or (patchopath.exists() and opath.samefile(patchopath))):
-				patchopath.parent.mkdir(parents=True)
-				shutil.copyfile(opath, patchopath)
-				opath = patchopath
-			if not (cortestperfect or (patchcpath.exists() and cpath.samefile(patchcpath))):
-				patchcpath.parent.mkdir(parents=True)
-				shutil.copyfile(cpath, patchcpath)
-				cpath = patchcpath
+			opath = consider_creating_patch(orgtestperfect, popath, opath)
+			cpath = consider_creating_patch(cortestperfect, pcpath, cpath)
 			return {
 				'user': stuid,
 				# 'qnum': ns.origqiddict[oqid]['qnum'],
 				'qid': oqid,
 				# 'sect': ns.correctiondict[stuid][oqid]['section'],
 				# 'exam': examid,
-				'org': f'=HYPERLINK("{opath}")'
+				'org': f'=HYPERLINK("{opath}")',
+				'org*': f'=HYPERLINK("{npopath}")' if opath == popath else None
 				} | subreport(report, 'org') | {
-				'cor': f'=HYPERLINK("{cpath}")'
+				'cor': f'=HYPERLINK("{cpath}")',
+				'cor*': f'=HYPERLINK("{npcpath}")' if cpath == pcpath else None
 				} | subreport(report, 'cor') | subreport(report, False)
 
 	return {
@@ -569,7 +574,7 @@ if __name__ == '__main__':
 	correctiondf = correctiondf.set_index(['user', 'qid']).sort_index()
 	for pcgpath in patchcorrectionsdir.glob("*/*/src/grade.txt"):
 		with open(pcgpath) as pcgf:
-			correctiondf.loc[(pcgpath.parts[-4], pcgpath.parts[-3]), 'grade-cor'] = int(pcgf.readline())
+			correctiondf.loc[(pcgpath.parts[-4], corrqiddict[pcgpath.parts[-3]]['origid']), 'grade-cor'] = int(pcgf.readline())
 	correctiondf = correctiondf.sort_values('grade-cor', ascending=False).groupby(['user', 'qid']).first().sort_index()
 
 	# COLLECT STUDENT INFO
@@ -580,35 +585,44 @@ if __name__ == '__main__':
 
 	# PREPARE REPORT
 
+	opaths = list(processedoriginalsdir.glob("*/*/*/src/Main.py"))
+
+
+	def patchpath(patchdir, stuid, qid):
+		return patchdir / stuid / qid / "src/Main.py"
+
+
+	def handle_patches(patchdir, stuid, qid, nppath):
+		ppath = patchpath(patchdir, stuid, qid)
+		if ppath.is_file():
+			create_nppath_backref(ppath, nppath)
+		
+		return ppath
+
+
+	def produce_arguments():
+		for npopath in (bar := alive_it(opaths)):
+			examid = npopath.parts[-5].split('_')[1]
+			stuid = npopath.parts[-4]
+			oqid = npopath.parts[-3]
+			cqid = origqiddict[oqid]['corrid']
+
+			bar.title(f'on {stuid}-{oqid}')
+
+			if cqid in correctiondict[stuid]:
+				npcpath = correctiondict[stuid][cqid]['path']
+				pcpath = handle_patches(patchcorrectionsdir, stuid, cqid, npcpath)
+				popath = handle_patches(patchoriginalsdir, stuid, oqid, npopath)
+
+				reportworthy = True # (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
+
+				yield examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewldict[oqid]
+
+
 	with Pool() as pool:
-		opaths = list(processedoriginalsdir.glob("*/*/*/src/Main.py"))
-		def produce_arguments():
-			for opath in (bar := alive_it(opaths)):
-				examid = opath.parts[-5].split('_')[1]
-				stuid = opath.parts[-4]
-				oqid = opath.parts[-3]
-				cqid = origqiddict[oqid]['corrid']
-
-				bar.title(f'on {stuid}-{oqid}')
-
-				if cqid in correctiondict[stuid]:
-					if patchifexists(patchcorrectionsdir, stuid, cqid):
-						with open(patchpath(patchcorrectionsdir, stuid, cqid).parent / 'backref.txt', "w") as bref:
-							bref.write(str(correctiondict[stuid][cqid]['path']))
-					if patchifexists(patchoriginalsdir, stuid, oqid):
-						with open(patchpath(patchoriginalsdir, stuid, oqid).parent / 'backref.txt', "w") as bref:
-							bref.write(str(opath))
-					cpath = patchifexists(patchcorrectionsdir, stuid, cqid) or correctiondict[stuid][cqid]['path']
-					opath = patchifexists(patchoriginalsdir, stuid, oqid) or opath
-
-					reportworthy = True # (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
-
-					yield examid, stuid, oqid, cpath, opath, reportworthy, vulturewldict[oqid], patchpath(patchcorrectionsdir, stuid, cqid), patchpath(patchoriginalsdir, stuid, oqid)
-
 		# arguments = list(produce_arguments())
 		# results = pool.starmap(analyze_stuq, tqdm(arguments))
 		results = pool.starmap(analyze_stuq, produce_arguments())
-
 		reportdf = pd.DataFrame(results)
 
 	if have_legitrange:
