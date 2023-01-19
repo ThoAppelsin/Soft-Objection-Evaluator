@@ -76,12 +76,12 @@ def sanitize(code, codepath, full=False):
 				rline = ''
 
 
-	def comment_index(line):
+	def comment_index(line, silent=False):
 		try:
 			comments = [x for x in tokenize.generate_tokens(StringIO(line).readline) if x[0] == tokenize.COMMENT]
 			return comments[0][2][1] if len(comments) == 1 else -1
 		except tokenize.TokenError as e:
-			if line.find('#') != -1:
+			if not silent and line.find('#') != -1:
 				print(f"[{resourceindicator}] We have a # and:", str(e))
 			return -1
 
@@ -145,7 +145,7 @@ def sanitize(code, codepath, full=False):
 
 
 	def remove_comments(code):
-		return (line if (ci := comment_index(line)) == -1 else line[:ci] for line in code)
+		return (line if (ci := comment_index(line, silent=True)) == -1 else line[:ci] for line in code)
 
 
 	def rstrip(code):
@@ -191,7 +191,18 @@ def extract_user_code(code):
 
 def calculate_edit_distance(old, new):
 	sm = edit_distance.SequenceMatcher(old, new)
-	return sm.distance()
+
+	width = max(len(l) for l in new)
+
+	def format_opcode(opcode):
+		tag, i1, i2, j1, j2 = opcode
+		return ((f'-{i2}' if tag in ['delete', 'replace'] else '').ljust(4) +
+			    (f'+{j2}' if tag in ['insert', 'replace'] else '').ljust(4) +
+			    ('' if j1 == j2 else new[j1]).ljust(width) +
+			    (("  #REMOVED:  " if tag == 'delete' else "  #REPLACED: ") + old[i1].strip() if tag in ['delete', 'replace'] else ''))
+
+	return {'edit_opcodes': 'old new\n' + '\n'.join(format_opcode(opcode) for opcode in sm.get_opcodes()),
+	        'edit_dist': sm.distance()}
 
 
 def run_pylint(testfpath):
@@ -249,7 +260,24 @@ def run_tests(code, vulturewlpath, prepend=''):
 
 
 def num_colon_follow(code):
-	return sum(0 <= line.find(':') < len(line)-1 for line in code)
+	def colon_follow_in_line(line):
+		try:
+			square_bracket_depth = 0
+			tokens = list(tokenize.generate_tokens(StringIO(line).readline))
+
+			for i, token in enumerate(tokens):
+				if token.type == tokenize.OP:
+					if token.string == ':' and square_bracket_depth == 0 and tokens[i+1].type != tokenize.NEWLINE:
+						return True
+					elif token.string == '[':
+						square_bracket_depth += 1
+					elif token.string == ']':
+						square_bracket_depth -= 1
+			return False
+		except tokenize.TokenError as e:
+			return 0 <= line.find(':') < len(line)-1
+
+	return sum(colon_follow_in_line(line) for line in code)
 
 
 def num_semicolon(code):
@@ -276,7 +304,7 @@ def num_comma(code):
 		except tokenize.TokenError as e:
 			return line.count(',') # len(re.findall(r""",\s*(?!"|'|\s|end\s*=)""", line))
 
-	return sum(num_comma_in_line(line) for line in code)
+	return sum(num_comma_in_line(line) for line in code if not any(line.lstrip().startswith(kw + " ") for kw in ["for", "if", "return"]))
 
 
 def num_exec(code):
@@ -315,6 +343,35 @@ def num_stray_and_or(code):
 	return sum(len(re.findall(r"""^(?:(?!if)(?!while).)*?\b(and|or)\b.*""", line)) for line in code)
 
 
+def num_blank_prints(code):
+	count = 0
+	loopindent = []
+	for line in code:
+		# skip the empty lines
+		if line.strip() == "":
+			continue
+
+		# reduce current indentation level so much so that we've dedented
+		while loopindent and not line.startswith(" " * (loopindent[-1] + 1)):
+			loopindent.pop()
+
+		match = re.match(r"^(\s*)(for|while) ", line)
+		if match:
+			loopindent.append(len(match[1]))
+		elif not loopindent:
+			count += len(re.findall(r"""print\s*\(\s*(("|'|\"\"\"|''')\s*\2)?\s*\)""", line))
+			count += len(re.findall(r"""print\s*\(\s*(("|'|\"\"\"|''')\s*\2)?\s*$""", line))
+			count += len(re.findall(r"""print\s*\(\s*("|'|\"\"\"|''')\s*$""", line))
+			count += len(re.findall(r"""print\s*\(\s*$""", line))
+	return count
+
+	# return len(re.findall(r"""print\s*\(\s*(("|'|\"\"\"|''')\s*\2)?\s*\)""", '\n'.join(code)))
+
+
+def num_continue(code):
+	return sum(line.strip() == "continue" for line in code)
+
+
 # class MultiAssignCountVisitor(ast.NodeVisitor):
 # 	def __init__(self, *args, **kwargs):
 # 		super().__init__(*args, **kwargs)
@@ -347,7 +404,9 @@ flawless = {
 	'org-#selas': 0,
 	'org-#esret': 0,
 	'org-#silao': 0,
-	'cor-#sryao': 0,
+	'org-#sryao': 0,
+	'org-#blprn': 0,
+	'org-#cont': 0,
 	'org-flagOK': True,
 	'org-pylint': True,
 	'org-vultur': True,
@@ -362,6 +421,8 @@ flawless = {
 	'cor-#esret': 0,
 	'cor-#silao': 0,
 	'cor-#sryao': 0,
+	'cor-#blprn': 0,
+	'cor-#cont': 0,
 	'cor-flagOK': True,
 	'cor-pylint': True,
 	'cor-vultur': True
@@ -399,6 +460,8 @@ def get_report(orgpath, corpath, vulturewlpath, should_sanitize=True):
 			'org-#esret': num_empty_string_return(org),
 			'org-#silao': num_silly_and_or(org),
 			'org-#sryao': num_stray_and_or(org),
+			'org-#blprn': num_blank_prints(org),
+			'org-#cont': num_continue(org),
 			'org-flagOK': orggoodflags,
 			} | run_tests(orgfull, vulturewlpath, 'org')
 		correport = {
@@ -414,9 +477,11 @@ def get_report(orgpath, corpath, vulturewlpath, should_sanitize=True):
 			'cor-#esret': num_empty_string_return(cor),
 			'cor-#silao': num_silly_and_or(cor),
 			'cor-#sryao': num_stray_and_or(cor),
+			'cor-#blprn': num_blank_prints(cor),
+			'org-#cont': num_continue(cor),
 			'cor-flagOK': corgoodflags
 			} | run_tests(corfull, vulturewlpath, 'cor')
-		report = {'edit_dist': calculate_edit_distance(org, cor)} | orgreport | correport
+		report = calculate_edit_distance(org, cor) | orgreport | correport
 		return report, get_flaws(orgreport) == "", get_flaws(correport) == ""
 	else:
 		return False
@@ -443,7 +508,7 @@ def collect_gradebook(path, suffix):
 def create_nppath_backref(ppath, nppath):
 	brefpath = ppath.parent / 'backref.txt'
 	with open(brefpath, "w") as bref:
-		bref.write(str(nppath))
+		bref.write(str(os.path.relpath(nppath, brefpath.parent)))
 
 
 def consider_creating_patch(isperfect, ppath, path):
@@ -456,7 +521,7 @@ def consider_creating_patch(isperfect, ppath, path):
 	return ppath
 
 
-def analyze_stuq(examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewlpath):
+def analyze_stuq(examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewlpath, examhome):
 	if reportworthy:
 		opath = popath if popath.is_file() else npopath
 		cpath = pcpath if pcpath.is_file() else npcpath
@@ -471,18 +536,18 @@ def analyze_stuq(examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportwo
 				'qid': oqid,
 				# 'sect': ns.correctiondict[stuid][oqid]['section'],
 				# 'exam': examid,
-				'org': f'=HYPERLINK("{opath}")',
-				'org*': f'=HYPERLINK("{npopath}")' if opath == popath else None
+				'org': f'=HYPERLINK("{opath.relative_to(examhome)}")',
+				'org*': f'=HYPERLINK("{npopath.relative_to(examhome)}")' if opath == popath else None
 				} | subreport(report, 'org') | {
-				'cor': f'=HYPERLINK("{cpath}")',
-				'cor*': f'=HYPERLINK("{npcpath}")' if cpath == pcpath else None
+				'cor': f'=HYPERLINK("{cpath.relative_to(examhome)}")',
+				'cor*': f'=HYPERLINK("{npcpath.relative_to(examhome)}")' if cpath == pcpath else None
 				} | subreport(report, 'cor') | subreport(report, False)
 
 	return {
 		'user': stuid,
 		'qid': oqid,
-		'org': f'=HYPERLINK("{opath}")',
-		'cor': f'=HYPERLINK("{cpath}")'
+		'org': f'=HYPERLINK("{opath.relative_to(examhome)}")',
+		'cor': f'=HYPERLINK("{cpath.relative_to(examhome)}")'
 		}
 
 
@@ -499,11 +564,16 @@ def format_excel(path, freezerows, freezecolumns):
 	wb.save(path)
 
 
+def enlist(obj):
+	return obj if type(obj) is list else [obj]
+
 
 if __name__ == '__main__':
-	CURRENT_EXAM = 1
+	CURRENT_EXAM = 3
 
 	coursehome = Path.home() / "Downloads/cmpe150fall2022"
+	have_legitrange = True
+	requires_full_grade_correction = False
 
 	if CURRENT_EXAM == 1:
 		examname = "mt1"
@@ -518,7 +588,6 @@ if __name__ == '__main__':
 			}
 	elif CURRENT_EXAM == 2:
 		examname = "mt2"
-		have_legitrange = True
 		origqiddict = {
 			'question1327': {'qnum': 'q1', 'corrid': 'question1336', 'legitrange': (6, 15)},
 			'question1328': {'qnum': 'q2', 'corrid': 'question1337', 'legitrange': (11, 25)},
@@ -527,8 +596,20 @@ if __name__ == '__main__':
 			'question1331': {'qnum': 'q2', 'corrid': 'question1340', 'legitrange': (11, 25)},
 			'question1332': {'qnum': 'q3', 'corrid': 'question1341', 'legitrange': (8, 20)}
 			}
+	elif CURRENT_EXAM == 3:
+		examname = "final"
+		requires_full_grade_correction = True
+		origqiddict = {
+			'question1369': {'qnum': 'q1', 'corrid': 'question1377', 'legitrange': (4, 10)},
+			'question1370': {'qnum': 'q2', 'corrid': 'question1378', 'legitrange': (8, 13)},
+			'question1371': {'qnum': 'q3', 'corrid': 'question1379', 'legitrange': (5, 12)},
+			'question1372': {'qnum': 'q4', 'corrid': ['question1380', 'question1384'], 'legitrange': (4, 12)},
+			'question1373': {'qnum': 'q1', 'corrid': 'question1381', 'legitrange': (6, 19)},
+			'question1374': {'qnum': 'q2', 'corrid': 'question1382', 'legitrange': (4, 9)},
+			'question1375': {'qnum': 'q3', 'corrid': 'question1383', 'legitrange': (5, 15)}
+			}
 
-	corrqiddict = {v['corrid'] : {'qnum': v['qnum'], 'origid': oqid} for oqid, v in origqiddict.items()}
+	corrqiddict = {cqid : {'qnum': v['qnum'], 'origid': oqid} for oqid, v in origqiddict.items() for cqid in enlist(v['corrid'])}
 
 	examhome = coursehome / examname
 
@@ -566,7 +647,10 @@ if __name__ == '__main__':
 	# COLLECT ORIGINAL GRADES
 	originalgradebooks = raworiginalshome.glob("*.xlsx")
 	originaldf = pd.DataFrame(chain(*(collect_gradebook(gb, 'org') for gb in originalgradebooks))).set_index(['user', 'qid']).sort_index()
-
+	for pogpath in patchoriginalsdir.glob("*/*/src/grade.txt"):
+		with open(pogpath) as pogf:
+			originaldf.loc[(pogpath.parts[-4], pogpath.parts[-3]), 'grade-org'] = float(pogf.readline())
+	
 	# COLLECT CORRECTION GRADES
 	correctiongradebooks = rawcorrectionshome.glob("*/*.xlsx")
 	correctiondf = pd.DataFrame(chain(*(collect_gradebook(gb, 'cor') for gb in correctiongradebooks)))
@@ -574,7 +658,7 @@ if __name__ == '__main__':
 	correctiondf = correctiondf.set_index(['user', 'qid']).sort_index()
 	for pcgpath in patchcorrectionsdir.glob("*/*/src/grade.txt"):
 		with open(pcgpath) as pcgf:
-			correctiondf.loc[(pcgpath.parts[-4], corrqiddict[pcgpath.parts[-3]]['origid']), 'grade-cor'] = int(pcgf.readline())
+			correctiondf.loc[(pcgpath.parts[-4], corrqiddict[pcgpath.parts[-3]]['origid']), 'grade-cor'] = float(pcgf.readline())
 	correctiondf = correctiondf.sort_values('grade-cor', ascending=False).groupby(['user', 'qid']).first().sort_index()
 
 	# COLLECT STUDENT INFO
@@ -605,18 +689,19 @@ if __name__ == '__main__':
 			examid = npopath.parts[-5].split('_')[1]
 			stuid = npopath.parts[-4]
 			oqid = npopath.parts[-3]
-			cqid = origqiddict[oqid]['corrid']
+			cqids = origqiddict[oqid]['corrid']
 
 			bar.title(f'on {stuid}-{oqid}')
 
-			if cqid in correctiondict[stuid]:
-				npcpath = correctiondict[stuid][cqid]['path']
-				pcpath = handle_patches(patchcorrectionsdir, stuid, cqid, npcpath)
-				popath = handle_patches(patchoriginalsdir, stuid, oqid, npopath)
+			for cqid in enlist(cqids):
+				if cqid in correctiondict[stuid]:
+					npcpath = correctiondict[stuid][cqid]['path']
+					pcpath = handle_patches(patchcorrectionsdir, stuid, cqid, npcpath)
+					popath = handle_patches(patchoriginalsdir, stuid, oqid, npopath)
 
-				reportworthy = True # (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
+					reportworthy = True # (stuid, oqid) in correctiondf.index and correctiondf.loc[(stuid, oqid), 'grade-cor'].item() > 0
 
-				yield examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewldict[oqid]
+					yield examid, stuid, oqid, npcpath, pcpath, npopath, popath, reportworthy, vulturewldict[oqid], examhome
 
 
 	with Pool() as pool:
@@ -646,7 +731,13 @@ if __name__ == '__main__':
 
 	df = originaldf.join(correctiondf).join(reportdf.set_index(['user', 'qid'])).reset_index(1)
 	df['qnum'] = df['qid'].apply(lambda x: origqiddict[x]['qnum'])
-	df['grade-new'] = pd.concat([df['grade-org'], df['grade-cor'] * df['ratio']], axis=1).max(axis=1)
+	if requires_full_grade_correction:
+		df['grade-new'] = pd.concat([df['grade-org'], (df['grade-cor'] == 100) * 100 * df['ratio']], axis=1).max(axis=1)
+	else:
+		df['grade-new'] = pd.concat([df['grade-org'], df['grade-cor'] * df['ratio']], axis=1).max(axis=1)
+
+	# gets rid of duplicate corrections when multiple correction projects are provided for the same exam project
+	df = df.reset_index().sort_values('grade-new', ascending=False).drop_duplicates(['user', 'qid']).set_index('user')
 
 	qnums = df['qnum'].unique()
 	df = df.pivot(columns='qnum').swaplevel(0, 1, axis=1).sort_index(axis=1)
