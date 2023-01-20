@@ -436,57 +436,61 @@ def get_flaws(report):
 
 
 def get_report(orgpath, corpath, vulturewlpath, should_sanitize=True):
-    with open(orgpath) as orgfile:
-        orgfull = orgfile.read().splitlines()
-        org, orggoodflags = extract_user_code(orgfull)
     with open(corpath) as corfile:
         corfull = corfile.read().splitlines()
         cor, corgoodflags = extract_user_code(corfull)
+
+    if should_sanitize:
+        cor = sanitize(cor, corpath)
+
+    if len(cor) == 0:
+        return False
+
+    with open(orgpath) as orgfile:
+        orgfull = orgfile.read().splitlines()
+        org, orggoodflags = extract_user_code(orgfull)
+
     if should_sanitize:
         orgfull = sanitize(orgfull, orgpath, True)
         corfull = sanitize(corfull, corpath, True)
         org = sanitize(org, orgpath)
-        cor = sanitize(cor, corpath)
 
-    if len(cor) > 0:
-        orgreport = {
-            'org-#lines' : len(org),
-            'org-#colfol': num_colon_follow(org),
-            'org-#semcol': num_semicolon(org),
-            'org-#comma': num_comma(org),
-            'org-#exec': num_exec(org),
-            'org-#mulas': num_multi_assign(org),
-            'org-#globl': num_global_nonlocal(org),
-            'org-#tern': num_ternary(org),
-            'org-#selas': num_self_assign(org),
-            'org-#esret': num_empty_string_return(org),
-            'org-#silao': num_silly_and_or(org),
-            'org-#sryao': num_stray_and_or(org),
-            'org-#blprn': num_blank_prints(org),
-            'org-#cont': num_continue(org),
-            'org-flagOK': orggoodflags,
-            } | run_tests(orgfull, vulturewlpath, 'org')
-        correport = {
-            'cor-#lines': len(cor),
-            'cor-#colfol': num_colon_follow(cor),
-            'cor-#semcol': num_semicolon(cor),
-            'cor-#comma': num_comma(cor),
-            'cor-#exec': num_exec(cor),
-            'cor-#mulas': num_multi_assign(cor),
-            'cor-#globl': num_global_nonlocal(cor),
-            'cor-#tern': num_ternary(cor),
-            'cor-#selas': num_self_assign(cor),
-            'cor-#esret': num_empty_string_return(cor),
-            'cor-#silao': num_silly_and_or(cor),
-            'cor-#sryao': num_stray_and_or(cor),
-            'cor-#blprn': num_blank_prints(cor),
-            'org-#cont': num_continue(cor),
-            'cor-flagOK': corgoodflags
-            } | run_tests(corfull, vulturewlpath, 'cor')
-        report = calculate_edit_distance(org, cor) | orgreport | correport
-        return report, get_flaws(orgreport) == "", get_flaws(correport) == ""
-    else:
-        return False
+    orgreport = {
+        'org-#lines' : len(org),
+        'org-#colfol': num_colon_follow(org),
+        'org-#semcol': num_semicolon(org),
+        'org-#comma': num_comma(org),
+        'org-#exec': num_exec(org),
+        'org-#mulas': num_multi_assign(org),
+        'org-#globl': num_global_nonlocal(org),
+        'org-#tern': num_ternary(org),
+        'org-#selas': num_self_assign(org),
+        'org-#esret': num_empty_string_return(org),
+        'org-#silao': num_silly_and_or(org),
+        'org-#sryao': num_stray_and_or(org),
+        'org-#blprn': num_blank_prints(org),
+        'org-#cont': num_continue(org),
+        'org-flagOK': orggoodflags,
+        } | run_tests(orgfull, vulturewlpath, 'org')
+    correport = {
+        'cor-#lines': len(cor),
+        'cor-#colfol': num_colon_follow(cor),
+        'cor-#semcol': num_semicolon(cor),
+        'cor-#comma': num_comma(cor),
+        'cor-#exec': num_exec(cor),
+        'cor-#mulas': num_multi_assign(cor),
+        'cor-#globl': num_global_nonlocal(cor),
+        'cor-#tern': num_ternary(cor),
+        'cor-#selas': num_self_assign(cor),
+        'cor-#esret': num_empty_string_return(cor),
+        'cor-#silao': num_silly_and_or(cor),
+        'cor-#sryao': num_stray_and_or(cor),
+        'cor-#blprn': num_blank_prints(cor),
+        'org-#cont': num_continue(cor),
+        'cor-flagOK': corgoodflags
+        } | run_tests(corfull, vulturewlpath, 'cor')
+    report = calculate_edit_distance(org, cor) | orgreport | correport
+    return report, get_flaws(orgreport) == "", get_flaws(correport) == ""
 
 
 def subreport(report, tag):

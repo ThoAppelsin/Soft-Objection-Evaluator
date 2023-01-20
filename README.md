@@ -22,6 +22,8 @@ This (effectively and ideally) achieves the following:
 - **Learning from mistakes --** Students are motivated towards revisiting their imperfect code, locating their mistakes, and fixing them up.
 - **Maximum parallelism --** The bulk of the task is to prepare the corrections, and that task is distributed across all the students.
 
+The script also runs in under 20 seconds, start-to-finish, to evaluate over 200 corrections.
+
 
 ## The bad
 
